@@ -10414,7 +10414,7 @@ int srt::CUDT::processData(CUnit* in_unit)
     // always immediately.
     int initial_loss_ttl = 0;
     if (m_bPeerRexmitFlag)
-        initial_loss_ttl = m_iReorderTolerance;
+        initial_loss_ttl = m_config.iMaxReorderTolerance;
 
     // Track packet loss in statistics early, because a packet filter (e.g. FEC) might recover it later on,
     // supply the missing packet(s), and the loss will no longer be visible for the code that follows.
@@ -10704,7 +10704,7 @@ int srt::CUDT::processData(CUnit* in_unit)
     if (m_bPeerRexmitFlag && was_sent_in_order)
     {
         ++m_iConsecOrderedDelivery;
-        if (m_iConsecOrderedDelivery >= 50)
+        if (0 && m_iConsecOrderedDelivery >= 50) // disable
         {
             m_iConsecOrderedDelivery = 0;
             if (m_iReorderTolerance > 0)
@@ -10867,7 +10867,7 @@ void srt::CUDT::unlose(const CPacket &packet)
             HLOGC(qrlog.Debug, log << "... arrived at TTL " << had_ttl << " case " << m_iConsecEarlyDelivery);
 
             // After 10 consecutive
-            if (m_iConsecEarlyDelivery >= 10)
+            if (0 && m_iConsecEarlyDelivery >= 10) // disable and 200
             {
                 m_iConsecEarlyDelivery = 0;
                 if (m_iReorderTolerance > 0)
