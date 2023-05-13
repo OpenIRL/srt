@@ -212,6 +212,8 @@ struct SrtOptionAction
         flags[SRTO_CRYPTOMODE]         = SRTO_R_PRE;
 #endif
 
+        flags[SRTO_SRTLAPATCHES]       = SRTO_R_PRE;
+
         // For "private" options (not derived from the listener
         // socket by an accepted socket) provide below private_default
         // to which these options will be reset after blindly
@@ -852,6 +854,11 @@ void srt::CUDT::getOpt(SRT_SOCKOPT optName, void *optval, int &optlen)
         optlen = sizeof(int32_t);
         break;
 #endif
+
+    case SRTO_SRTLAPATCHES:
+        optlen          = sizeof(bool);
+        *(bool *)optval = m_config.srtlaPatches;
+        break;
 
     default:
         throw CUDTException(MJ_NOTSUP, MN_NONE, 0);
@@ -10413,8 +10420,10 @@ int srt::CUDT::processData(CUnit* in_unit)
     // If the peer doesn't understand REXMIT flag, send rexmit request
     // always immediately.
     int initial_loss_ttl = 0;
-    if (m_bPeerRexmitFlag)
+    if (m_config.srtlaPatches && m_bPeerRexmitFlag)
         initial_loss_ttl = m_config.iMaxReorderTolerance;
+    else if (!m_config.srtlaPatches && m_bPeerRexmitFlag)
+        initial_loss_ttl = m_iReorderTolerance;
 
     // Track packet loss in statistics early, because a packet filter (e.g. FEC) might recover it later on,
     // supply the missing packet(s), and the loss will no longer be visible for the code that follows.
@@ -10704,7 +10713,7 @@ int srt::CUDT::processData(CUnit* in_unit)
     if (m_bPeerRexmitFlag && was_sent_in_order)
     {
         ++m_iConsecOrderedDelivery;
-        if (0 && m_iConsecOrderedDelivery >= 50) // disable
+        if (!m_config.srtlaPatches && m_iConsecOrderedDelivery >= 50)
         {
             m_iConsecOrderedDelivery = 0;
             if (m_iReorderTolerance > 0)
@@ -10867,7 +10876,7 @@ void srt::CUDT::unlose(const CPacket &packet)
             HLOGC(qrlog.Debug, log << "... arrived at TTL " << had_ttl << " case " << m_iConsecEarlyDelivery);
 
             // After 10 consecutive
-            if (0 && m_iConsecEarlyDelivery >= 10) // disable and 200
+            if (!m_config.srtlaPatches && m_iConsecEarlyDelivery >= 10)
             {
                 m_iConsecEarlyDelivery = 0;
                 if (m_iReorderTolerance > 0)
@@ -11451,7 +11460,8 @@ int srt::CUDT::checkNAKTimer(const steady_clock::time_point& currtime)
         if (currtime <= m_tsNextNAKTime.load())
             return BECAUSE_NO_REASON; // wait for next NAK time
 
-        //sendCtrl(UMSG_LOSSREPORT); //periodic retransmissions
+        if (!m_config.srtlaPatches)
+            sendCtrl(UMSG_LOSSREPORT);
         debug_decision = BECAUSE_NAKREPORT;
     }
 
