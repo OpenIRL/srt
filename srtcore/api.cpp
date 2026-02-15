@@ -4349,6 +4349,29 @@ int srt::CUDT::bstats(SRTSOCKET u, CBytePerfMon* perf, bool clear, bool instanta
     }
 }
 
+int srt::CUDT::srtla_stats(SRTSOCKET u, SRT_SRTLA_STATS* stats)
+{
+    if (!stats)
+        return APIError(MJ_NOTSUP, MN_INVAL, 0);
+
+    try
+    {
+        CUDT& udt = uglobal().locateSocket(u, CUDTUnited::ERH_THROW)->core();
+        ScopedLock lock(udt.m_SrtlaStatsLock);
+        *stats = udt.m_SrtlaStats;
+        return 0;
+    }
+    catch (const CUDTException& e)
+    {
+        return APIError(e);
+    }
+    catch (const std::exception& ee)
+    {
+        LOGC(aclog.Fatal, log << "srtla_stats: UNEXPECTED EXCEPTION: " << typeid(ee).name() << ": " << ee.what());
+        return APIError(MJ_UNKNOWN, MN_NONE, 0);
+    }
+}
+
 #if ENABLE_BONDING
 int srt::CUDT::groupsockbstats(SRTSOCKET u, CBytePerfMon* perf, bool clear)
 {

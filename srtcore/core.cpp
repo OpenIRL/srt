@@ -305,6 +305,8 @@ void srt::CUDT::construct()
     m_bPeerTLPktDrop      = false;
     m_bBufferWasFull      = false;
 
+    memset(&m_SrtlaStats, 0, sizeof(m_SrtlaStats));
+
     // Initilize mutex and condition variables.
     initSynch();
 
@@ -9230,9 +9232,80 @@ void srt::CUDT::processCtrl(const CPacket &ctrlpkt)
         processCtrlUserDefined(ctrlpkt);
         break;
 
+    case UMSG_SRTLA_STATS:
+        if (m_config.srtlaPatches)
+            processSrtlaStats(ctrlpkt);
+        break;
+
     default:
         break;
     }
+}
+
+void srt::CUDT::processSrtlaStats(const CPacket& ctrlpkt)
+{
+    // Payload has already been converted to host byte order by toHostByteOrder()/NtoHLA.
+    // Stats-Header: 4 words (16 bytes)
+    //   Word 0: [version:8][num_peers:8][reserved:16]
+    //   Word 1: group_total_bitrate
+    //   Word 2: timestamp_high
+    //   Word 3: timestamp_low
+    // Per-Peer: 6 words (24 bytes) each, max 16 (conn_id, bitrate, jitter, bytes_hi, bytes_lo, uptime)
+
+    const uint32_t* payload = reinterpret_cast<const uint32_t*>(ctrlpkt.data());
+    const size_t payload_len = ctrlpkt.size();
+
+    // Minimum: stats header = 4 words = 16 bytes
+    if (payload_len < 16)
+    {
+        HLOGC(inlog.Debug, log << CONID() << "SRTLA stats: packet too short (" << payload_len << " bytes)");
+        return;
+    }
+
+    const uint32_t word0 = payload[0];
+    const uint8_t version = (word0 >> 24) & 0xFF;
+    const uint8_t num_peers = (word0 >> 16) & 0xFF;
+
+    if (version != 1)
+    {
+        HLOGC(inlog.Debug, log << CONID() << "SRTLA stats: unknown version " << int(version));
+        return;
+    }
+
+    if (num_peers > SRT_SRTLA_MAX_PEERS)
+    {
+        HLOGC(inlog.Debug, log << CONID() << "SRTLA stats: too many peers (" << int(num_peers) << ")");
+        return;
+    }
+
+    // Check payload size: header (16) + num_peers * 24
+    const size_t expected = 16 + static_cast<size_t>(num_peers) * 24;
+    if (payload_len < expected)
+    {
+        HLOGC(inlog.Debug, log << CONID() << "SRTLA stats: payload too short for " << int(num_peers) << " peers");
+        return;
+    }
+
+    SRT_SRTLA_STATS stats;
+    memset(&stats, 0, sizeof(stats));
+    stats.valid = 1;
+    stats.version = version;
+    stats.numPeers = num_peers;
+    stats.totalBitrate = payload[1];
+    stats.timestamp = (static_cast<uint64_t>(payload[2]) << 32) | payload[3];
+
+    for (uint8_t i = 0; i < num_peers; i++)
+    {
+        const uint32_t* peer = payload + 4 + i * 6;
+        stats.peers[i].connectionId   = peer[0];
+        stats.peers[i].bitrate  = peer[1];
+        stats.peers[i].jitter   = peer[2];
+        stats.peers[i].bytesReceived  = (static_cast<uint64_t>(peer[3]) << 32) | peer[4];
+        stats.peers[i].uptime   = peer[5];
+    }
+
+    ScopedLock lock(m_SrtlaStatsLock);
+    m_SrtlaStats = stats;
 }
 
 void srt::CUDT::updateSrtRcvSettings()
@@ -10667,14 +10740,27 @@ int srt::CUDT::processData(CUnit* in_unit)
         {
             deque<CRcvFreshLoss>::iterator i = m_FreshLoss.begin();
 
-            // Phase 1: take while TTL <= 0.
-            // There can be more than one record with the same TTL, if it has happened before
-            // that there was an 'unlost' (@c dropFromLossLists) sequence that has split one detected loss
-            // into two records.
-            for (; i != m_FreshLoss.end() && i->ttl <= 0; ++i)
+            // Phase 1: take entries whose reorder tolerance has expired.
+            // Expiry by packet count (TTL <= 0) or, with SRTLA patches, by time (500ms).
+            // The time cap prevents long ACK stalls at low bitrate where a packet-count-based
+            // TTL of 200 could take seconds to expire.
+            // Both orderings (TTL and timestamp) are monotonically non-decreasing from front
+            // to back, so the first non-expired entry means all following are also non-expired.
+            const steady_clock::time_point tnow = steady_clock::now();
+            static const steady_clock::duration SRTLA_LOSS_TTL_TIMEOUT = milliseconds_from(500);
+
+            for (; i != m_FreshLoss.end(); ++i)
             {
+                const bool expired_by_count = (i->ttl <= 0);
+                const bool expired_by_time  = m_config.srtlaPatches &&
+                    (tnow - i->timestamp >= SRTLA_LOSS_TTL_TIMEOUT);
+
+                if (!expired_by_count && !expired_by_time)
+                    break;
+
                 HLOGC(qrlog.Debug, log << "Packet seq " << i->seq[0] << "-" << i->seq[1]
-                        << " (" << (CSeqNo::seqoff(i->seq[0], i->seq[1]) + 1) << " packets) considered lost - sending LOSSREPORT");
+                        << " (" << (CSeqNo::seqoff(i->seq[0], i->seq[1]) + 1) << " packets) considered lost - sending LOSSREPORT"
+                        << (expired_by_time && !expired_by_count ? " (time-based)" : ""));
                 addLossRecord(lossdata, i->seq[0], i->seq[1]);
             }
 

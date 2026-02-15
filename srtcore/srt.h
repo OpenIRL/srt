@@ -992,6 +992,28 @@ SRT_API int srt_config_add(SRT_SOCKOPT_CONFIG* config, SRT_SOCKOPT option, const
 SRT_API SRT_SOCKGROUPCONFIG srt_prepare_endpoint(const struct sockaddr* src /*nullable*/, const struct sockaddr* adr, int namelen);
 SRT_API       int srt_connect_group(SRTSOCKET group, SRT_SOCKGROUPCONFIG name[], int arraysize);
 
+// SRTLA per-connection statistics
+#define SRT_SRTLA_MAX_PEERS 16
+
+typedef struct SRT_SRTLA_PEER_STATS_ {
+    uint32_t connectionId;      // Anonymous FNV-1a hash of IP:port
+    uint32_t bitrate;
+    uint32_t jitter;            // Smoothed jitter in microseconds (RFC 3550)
+    uint64_t bytesReceived;
+    uint32_t uptime;            // Connection uptime in seconds
+} SRT_SRTLA_PEER_STATS;
+
+typedef struct SRT_SRTLA_STATS_ {
+    int      valid;             // 1 if stats received, 0 otherwise
+    uint8_t  version;
+    uint8_t  numPeers;
+    uint32_t totalBitrate;
+    uint64_t timestamp;         // Monotonic ms from srtla_rec
+    SRT_SRTLA_PEER_STATS peers[SRT_SRTLA_MAX_PEERS];
+} SRT_SRTLA_STATS;
+
+SRT_API int srt_srtla_stats(SRTSOCKET u, SRT_SRTLA_STATS* stats);
+
 #ifdef __cplusplus
 }
 #endif

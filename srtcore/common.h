@@ -221,6 +221,7 @@ enum UDTMessageType
     UMSG_PEERERROR = 8, //< Signal from the Peer side. Add info: Error code.
     // ... add extra code types here
     UMSG_END_OF_TYPES,
+    UMSG_SRTLA_STATS = 0x1300, //< SRTLA per-connection statistics (custom type via srtla_rec)
     UMSG_EXT = 0x7FFF //< For the use of user-defined control packets.
 };
 
