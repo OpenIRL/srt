@@ -9247,10 +9247,10 @@ void srt::CUDT::processSrtlaStats(const CPacket& ctrlpkt)
     // Payload has already been converted to host byte order by toHostByteOrder()/NtoHLA.
     // Stats-Header: 4 words (16 bytes)
     //   Word 0: [version:8][num_peers:8][reserved:16]
-    //   Word 1: group_total_bitrate
+    //   Word 1: group_total_bitrate (kbps, payload only)
     //   Word 2: timestamp_high
     //   Word 3: timestamp_low
-    // Per-Peer: 6 words (24 bytes) each, max 16 (conn_id, bitrate, jitter, bytes_hi, bytes_lo, uptime)
+    // Per-Peer: 7 words (conn_id, bitrate, jitter, bytes_hi, bytes_lo, uptime, throughput)
 
     const uint32_t* payload = reinterpret_cast<const uint32_t*>(ctrlpkt.data());
     const size_t payload_len = ctrlpkt.size();
@@ -9278,8 +9278,8 @@ void srt::CUDT::processSrtlaStats(const CPacket& ctrlpkt)
         return;
     }
 
-    // Check payload size: header (16) + num_peers * 24
-    const size_t expected = 16 + static_cast<size_t>(num_peers) * 24;
+    // Check payload size: header (16) + num_peers * 7 words * 4 bytes
+    const size_t expected = 16 + static_cast<size_t>(num_peers) * 28;
     if (payload_len < expected)
     {
         HLOGC(inlog.Debug, log << CONID() << "SRTLA stats: payload too short for " << int(num_peers) << " peers");
@@ -9296,12 +9296,13 @@ void srt::CUDT::processSrtlaStats(const CPacket& ctrlpkt)
 
     for (uint8_t i = 0; i < num_peers; i++)
     {
-        const uint32_t* peer = payload + 4 + i * 6;
+        const uint32_t* peer = payload + 4 + i * 7;
         stats.peers[i].connectionId   = peer[0];
         stats.peers[i].bitrate  = peer[1];
         stats.peers[i].jitter   = peer[2];
         stats.peers[i].bytesReceived  = (static_cast<uint64_t>(peer[3]) << 32) | peer[4];
         stats.peers[i].uptime   = peer[5];
+        stats.peers[i].throughput = peer[6];
     }
 
     ScopedLock lock(m_SrtlaStatsLock);

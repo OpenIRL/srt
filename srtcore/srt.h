@@ -997,17 +997,18 @@ SRT_API       int srt_connect_group(SRTSOCKET group, SRT_SOCKGROUPCONFIG name[],
 
 typedef struct SRT_SRTLA_PEER_STATS_ {
     uint32_t connectionId;      // Anonymous FNV-1a hash of IP:port
-    uint32_t bitrate;
+    uint32_t bitrate;           // Usable payload bitrate in kbps (unique data, no headers)
     uint32_t jitter;            // Smoothed jitter in microseconds (RFC 3550)
     uint64_t bytesReceived;
     uint32_t uptime;            // Connection uptime in seconds
+    uint32_t throughput;        // Total network throughput in kbps (including retransmissions)
 } SRT_SRTLA_PEER_STATS;
 
 typedef struct SRT_SRTLA_STATS_ {
     int      valid;             // 1 if stats received, 0 otherwise
     uint8_t  version;
     uint8_t  numPeers;
-    uint32_t totalBitrate;
+    uint32_t totalBitrate;      // Total usable payload bitrate in kbps
     uint64_t timestamp;         // Monotonic ms from srtla_rec
     SRT_SRTLA_PEER_STATS peers[SRT_SRTLA_MAX_PEERS];
 } SRT_SRTLA_STATS;
