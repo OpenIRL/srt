@@ -1,0 +1,98 @@
+name: Upstream release watch (Haivision SRT)
+
+# OpenIRL-specific automation (lives only on `main`).
+#
+# Watches Haivision SRT for a new STABLE release and, when one appears, opens a
+# tracking ISSUE telling you to merge it. It deliberately does NOT push a branch
+# or open a PR: the upstream tree contains `.github/workflows/*` files, and the
+# Actions GITHUB_TOKEN is forbidden from pushing workflow-file changes. Your own
+# local git credentials are not restricted that way, so the actual merge is done
+# on your machine with `scripts/upstream-merge.sh` (referenced from the issue).
+#
+# Only stable releases count: GitHub's "latest release" (prerelease=false).
+# `-rc.*` prereleases and raw master commits are ignored. No PAT required.
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'   # Mondays 06:17 UTC — releases are ~yearly, weekly poll is plenty
+  workflow_dispatch:        # allow manual runs
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve latest stable Haivision release
+        id: rel
+        run: |
+          set -euo pipefail
+          TAG="$(gh api repos/Haivision/srt/releases/latest --jq .tag_name)"
+          echo "Latest stable Haivision release: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Is it already merged into main?
+        id: need
+        run: |
+          set -euo pipefail
+          git remote add haivision https://github.com/Haivision/srt.git 2>/dev/null || true
+          git fetch --no-tags haivision "+refs/tags/${{ steps.rel.outputs.tag }}:refs/tags/${{ steps.rel.outputs.tag }}"
+          SHA="$(git rev-parse "refs/tags/${{ steps.rel.outputs.tag }}^{commit}")"
+          if [ "$(git rev-list --count "HEAD..$SHA")" = "0" ]; then
+            echo "main already contains ${{ steps.rel.outputs.tag }} — no issue needed."
+            echo "open=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "open=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open tracking issue (if new and none open yet)
+        if: steps.need.outputs.open == 'true'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.rel.outputs.tag }}"
+          TITLE="Upstream: merge Haivision SRT $TAG"
+
+          # De-dupe: skip if an open issue with this exact title already exists.
+          EXISTING="$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number' || true)"
+          if [ -n "$EXISTING" ]; then
+            echo "Tracking issue already open (#$EXISTING) — nothing to do."
+            exit 0
+          fi
+
+          # Build the body with a quoted heredoc (no shell interpolation, so
+          # backticks / code fences stay literal), then substitute the tag.
+          cat > /tmp/issue-body.md <<'EOF'
+          Haivision published a new **stable** SRT release: **__TAG__**
+          (https://github.com/Haivision/srt/releases/tag/__TAG__).
+
+          Merge it into `main` from your machine with the helper script — it updates
+          the `upstream` mirror branch, pushes it, and merges into `main`, leaving
+          any conflicts for you to resolve:
+
+          ```bash
+          scripts/upstream-merge.sh __TAG__
+          ```
+
+          The SRTLA extension (`srtcore/srtla_rec.*`, AGPL-3.0) hooks into core
+          libsrt files (`queue.cpp`, `core.cpp`, `socketconfig.*`, `srt.h`), so
+          expect conflicts there — resolve them by hand, keep the merge commit
+          (do **not** squash), build & test, then `git push origin main`.
+
+          Close this issue once __TAG__ is merged.
+          EOF
+          sed -i "s/__TAG__/$TAG/g" /tmp/issue-body.md
+
+          gh issue create --title "$TITLE" --body-file /tmp/issue-body.md
