@@ -119,6 +119,15 @@ public:
 
     int sendto(const sockaddr_any& addr, srt::CPacket& packet, const sockaddr_any& src) const;
 
+    /// Send a raw datagram verbatim (no SRT framing / no byte-order conversion).
+    /// Used by the SRTLA demux for its native control packets (REG2/REG3/SRTLA-ACK/
+    /// keepalive), whose payloads are opaque wire bytes that must not be word-swapped.
+    /// @param [in] addr destination address.
+    /// @param [in] data pointer to the datagram bytes.
+    /// @param [in] len  number of bytes to send.
+    /// @return Number of bytes sent, or -1 on error.
+    int sendtoRaw(const sockaddr_any& addr, const char* data, size_t len) const;
+
     /// Receive a packet from the channel and record the source address.
     /// @param [in] addr pointer to the source address.
     /// @param [in] packet reference to a CPacket entity.

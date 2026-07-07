@@ -662,6 +662,19 @@ void srt::CChannel::getPeerAddr(sockaddr_any& w_addr) const
     w_addr.len = namelen;
 }
 
+int srt::CChannel::sendtoRaw(const sockaddr_any& addr, const char* data, size_t len) const
+{
+    // Plain UDP send of an already-serialized datagram. No CPacket framing and no
+    // byte-order conversion: the SRTLA demux builds its packets directly in network
+    // (wire) byte order, so they must go out untouched.
+#ifndef _WIN32
+    const int res = (int)::sendto(m_iSocket, data, len, 0, addr.get(), addr.size());
+#else
+    const int res = (int)::sendto(m_iSocket, data, (int)len, 0, addr.get(), addr.size());
+#endif
+    return res;
+}
+
 int srt::CChannel::sendto(const sockaddr_any& addr, CPacket& packet, const sockaddr_any& source_addr SRT_ATR_UNUSED) const
 {
 #if ENABLE_HEAVY_LOGGING

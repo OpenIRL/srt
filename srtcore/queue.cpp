@@ -60,6 +60,7 @@ modified by
 #include "threadname.h"
 #include "logging.h"
 #include "queue.h"
+#include "srtla_rec.h"
 
 using namespace std;
 using namespace srt::sync;
@@ -409,6 +410,7 @@ srt::CSndQueue::CSndQueue()
     : m_pSndUList(NULL)
     , m_pChannel(NULL)
     , m_pTimer(NULL)
+    , m_pSrtlaRec(NULL)
     , m_bClosing(false)
 {
 }
@@ -599,7 +601,11 @@ void* srt::CSndQueue::worker(void* param)
             self->m_pSndUList->update(u, CSndUList::DO_RESCHEDULE, next_send_time);
 
         HLOGC(qslog.Debug, log << self->CONID() << "chn:SENDING: " << pkt.Info());
-        self->m_pChannel->sendto(addr, pkt, source_addr);
+        // SRTLA egress: for a group destination, fan SRT ACK/NAK out to all links and
+        // redirect everything else to the active link. Non-SRTLA destinations return
+        // false and are sent normally.
+        if (!(self->m_pSrtlaRec && self->m_pSrtlaRec->onEgress(addr, pkt, source_addr)))
+            self->m_pChannel->sendto(addr, pkt, source_addr);
 
         IF_DEBUG_HIGHRATE(self->m_WorkerStats.lSendTo++);
     }
@@ -614,7 +620,10 @@ int srt::CSndQueue::sendto(const sockaddr_any& addr, CPacket& w_packet, const so
     // NOTE: w_packet is passed by mutable reference because this function will do
     // a modification in place and then it will revert it. After returning this object
     // should look unmodified, hence it is here passed without a reference marker.
-    m_pChannel->sendto(addr, w_packet, src);
+    // SRTLA egress (high-priority control path, e.g. SRT ACK/NAK): fan out over the
+    // group's links; non-SRTLA destinations are sent normally.
+    if (!(m_pSrtlaRec && m_pSrtlaRec->onEgress(addr, w_packet, src)))
+        m_pChannel->sendto(addr, w_packet, src);
     return (int)w_packet.getLength();
 }
 
@@ -1154,6 +1163,7 @@ srt::CRcvQueue::CRcvQueue()
     , m_pHash(NULL)
     , m_pChannel(NULL)
     , m_pTimer(NULL)
+    , m_pSrtlaRec(NULL)
     , m_iIPversion()
     , m_szPayloadSize()
     , m_bClosing(false)
@@ -1248,6 +1258,14 @@ void* srt::CRcvQueue::worker(void* param)
         INCREMENT_THREAD_ITERATIONS();
         if (rst == RST_OK)
         {
+            // SRTLA ingress: classify the datagram by its source address and first
+            // bytes. Registration / keepalive / SRTLA-ACK bookkeeping is consumed here
+            // (SRTLA_DROP); SRT traffic from a registered link falls through to the
+            // normal dispatch below. This runs before the id<0 check because SRTLA
+            // control packets carry a meaningless destination-id field.
+            if (self->m_pSrtlaRec && self->m_pSrtlaRec->onIngress(sa, unit) == SrtlaRec::SRTLA_DROP)
+                continue;
+
             if (id < 0)
             {
                 // User error on peer. May log something, but generally can only ignore it.
@@ -1308,6 +1326,11 @@ void* srt::CRcvQueue::worker(void* param)
             break;
         }
         // OTHERWISE: this is an "AGAIN" situation. No data was read, but the process should continue.
+
+        // SRTLA periodic pass (link/group timeouts, recovery keepalives, per-second
+        // stats). Runs every loop iteration, including idle ones; internally throttled.
+        if (self->m_pSrtlaRec)
+            self->m_pSrtlaRec->onPeriodic(steady_clock::now());
 
         // take care of the timing event for all UDT sockets
         const steady_clock::time_point curtime_minus_syn =
@@ -1481,7 +1504,10 @@ srt::EConnectStatus srt::CRcvQueue::worker_ProcessAddressedPacket(int32_t id, CU
 
     // Found associated CUDT - process this as control or data packet
     // addressed to an associated socket.
-    if (addr != u->m_PeerAddr)
+    // SRTLA relaxation: a bonded connection legitimately receives packets from any of
+    // its registered links, not just m_PeerAddr. The demux already validated link
+    // membership on ingress, so skip the single-peer equality check for SRTLA CUDTs.
+    if (addr != u->m_PeerAddr && !u->m_config.bSRTLA)
     {
         HLOGC(cnlog.Debug,
               log << CONID() << "Packet for SID=" << id << " asoc with " << u->m_PeerAddr.str() << " received from "
@@ -1816,6 +1842,9 @@ void srt::CMultiplexer::destroy()
     // Reverse order of the assigned.
     delete m_pRcvQueue;
     delete m_pSndQueue;
+    // The demux is borrowed by both queues; delete it only after their workers have
+    // joined (queue destructors above) and before the channel it sends through.
+    delete m_pSrtlaRec;
     delete m_pTimer;
 
     if (m_pChannel)

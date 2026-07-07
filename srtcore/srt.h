@@ -234,7 +234,10 @@ typedef enum SRT_SOCKOPT {
    SRTO_MAXREXMITBW = 63,    // Maximum bandwidth limit for retransmision (Bytes/s)
 #endif
 
-   SRTO_SRTLAPATCHES = 120, // Enable SRTLA patches
+   SRTO_SRTLA = 120, // On a listener: designate an SRTLA (link-aggregation) demux listener.
+                     // Inherited by accepted connections, where it also enables the SRTLA
+                     // multipath delivery tuning (retransmit-flag / ordered-delivery heuristics).
+                     // (Formerly SRTO_SRTLAPATCHES.)
 
    SRTO_E_SIZE // Always last element, not a valid option.
 } SRT_SOCKOPT;
@@ -995,21 +998,21 @@ SRT_API       int srt_connect_group(SRTSOCKET group, SRT_SOCKGROUPCONFIG name[],
 // SRTLA per-connection statistics
 #define SRT_SRTLA_MAX_PEERS 16
 
+// Live per-link values, maintained as per-packet EWMAs and read fresh (like SRT's msRTT).
 typedef struct SRT_SRTLA_PEER_STATS_ {
     uint32_t connectionId;      // Anonymous FNV-1a hash of IP:port
-    uint32_t bitrate;           // Usable payload bitrate in kbps (unique data, no headers)
-    uint32_t jitter;            // Smoothed jitter in microseconds (RFC 3550)
-    uint64_t bytesReceived;
-    uint32_t uptime;            // Connection uptime in seconds
-    uint32_t throughput;        // Total network throughput in kbps (including retransmissions)
+    uint32_t kbpsRecvRate;      // total receive rate, kbps (incl. retransmissions & control)
+    uint32_t kbpsRecvUnique;    // first-seen (non-duplicate) receive rate, kbps
+    int32_t  transitUs;         // smoothed relative one-way transit (consumer anchors RTT to msRTT)
+    uint32_t usJitter;          // smoothed jitter, microseconds (RFC 3550)
+    uint64_t establishedMs;     // link start, demux monotonic milliseconds
 } SRT_SRTLA_PEER_STATS;
 
 typedef struct SRT_SRTLA_STATS_ {
-    int      valid;             // 1 if stats received, 0 otherwise
-    uint8_t  version;
+    int      valid;             // 1 if a bound SRTLA group was found for the socket, else 0
+    uint8_t  version;           // 2
     uint8_t  numPeers;
-    uint32_t totalBitrate;      // Total usable payload bitrate in kbps
-    uint64_t timestamp;         // Monotonic ms from srtla_rec
+    uint64_t nowMs;             // demux monotonic "now" (derive uptime = nowMs - establishedMs)
     SRT_SRTLA_PEER_STATS peers[SRT_SRTLA_MAX_PEERS];
 } SRT_SRTLA_STATS;
 

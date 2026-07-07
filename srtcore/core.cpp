@@ -66,6 +66,7 @@ modified by
 #include "queue.h"
 #include "api.h"
 #include "core.h"
+#include "srtla_rec.h"
 #include "logging.h"
 #include "crypto.h"
 #include "logging_api.h" // Required due to containing extern srt_logger_config
@@ -212,7 +213,7 @@ struct SrtOptionAction
         flags[SRTO_CRYPTOMODE]         = SRTO_R_PRE;
 #endif
 
-        flags[SRTO_SRTLAPATCHES]       = SRTO_R_PRE;
+        flags[SRTO_SRTLA]              = SRTO_R_PRE;
 
         // For "private" options (not derived from the listener
         // socket by an accepted socket) provide below private_default
@@ -304,8 +305,6 @@ void srt::CUDT::construct()
     m_bGroupTsbPd         = false;
     m_bPeerTLPktDrop      = false;
     m_bBufferWasFull      = false;
-
-    memset(&m_SrtlaStats, 0, sizeof(m_SrtlaStats));
 
     // Initilize mutex and condition variables.
     initSynch();
@@ -857,9 +856,9 @@ void srt::CUDT::getOpt(SRT_SOCKOPT optName, void *optval, int &optlen)
         break;
 #endif
 
-    case SRTO_SRTLAPATCHES:
+    case SRTO_SRTLA:
         optlen          = sizeof(bool);
-        *(bool *)optval = m_config.srtlaPatches;
+        *(bool *)optval = m_config.bSRTLA;
         break;
 
     default:
@@ -5832,6 +5831,14 @@ void srt::CUDT::acceptAndRespond(const sockaddr_any& agent, const sockaddr_any& 
 
     m_PeerAddr = peer;
 
+    // SRTLA binding moment: if this connection was accepted on an SRTLA demux
+    // listener, associate the new CUDT with the group whose registered link is
+    // @a peer, so that every link of the group routes here and the reverse path
+    // (ACK/NAK fan-out) can find the group. m_config.bSRTLA is already inherited
+    // from the listener, so the multipath tuning and peer-check relaxation are on.
+    if (m_pRcvQueue && m_pRcvQueue->m_pSrtlaRec)
+        m_pRcvQueue->m_pSrtlaRec->bindGroup(peer, this);
+
     // This should extract the HSREQ and KMREQ portion in the handshake packet.
     // This could still be a HSv4 packet and contain no such parts, which will leave
     // this entity as "non-SRT-handshaken", and await further HSREQ and KMREQ sent
@@ -9232,81 +9239,9 @@ void srt::CUDT::processCtrl(const CPacket &ctrlpkt)
         processCtrlUserDefined(ctrlpkt);
         break;
 
-    case UMSG_SRTLA_STATS:
-        if (m_config.srtlaPatches)
-            processSrtlaStats(ctrlpkt);
-        break;
-
     default:
         break;
     }
-}
-
-void srt::CUDT::processSrtlaStats(const CPacket& ctrlpkt)
-{
-    // Payload has already been converted to host byte order by toHostByteOrder()/NtoHLA.
-    // Stats-Header: 4 words (16 bytes)
-    //   Word 0: [version:8][num_peers:8][reserved:16]
-    //   Word 1: group_total_bitrate (kbps, payload only)
-    //   Word 2: timestamp_high
-    //   Word 3: timestamp_low
-    // Per-Peer: 7 words (conn_id, bitrate, jitter, bytes_hi, bytes_lo, uptime, throughput)
-
-    const uint32_t* payload = reinterpret_cast<const uint32_t*>(ctrlpkt.data());
-    const size_t payload_len = ctrlpkt.size();
-
-    // Minimum: stats header = 4 words = 16 bytes
-    if (payload_len < 16)
-    {
-        HLOGC(inlog.Debug, log << CONID() << "SRTLA stats: packet too short (" << payload_len << " bytes)");
-        return;
-    }
-
-    const uint32_t word0 = payload[0];
-    const uint8_t version = (word0 >> 24) & 0xFF;
-    const uint8_t num_peers = (word0 >> 16) & 0xFF;
-
-    if (version != 1)
-    {
-        HLOGC(inlog.Debug, log << CONID() << "SRTLA stats: unknown version " << int(version));
-        return;
-    }
-
-    if (num_peers > SRT_SRTLA_MAX_PEERS)
-    {
-        HLOGC(inlog.Debug, log << CONID() << "SRTLA stats: too many peers (" << int(num_peers) << ")");
-        return;
-    }
-
-    // Check payload size: header (16) + num_peers * 7 words * 4 bytes
-    const size_t expected = 16 + static_cast<size_t>(num_peers) * 28;
-    if (payload_len < expected)
-    {
-        HLOGC(inlog.Debug, log << CONID() << "SRTLA stats: payload too short for " << int(num_peers) << " peers");
-        return;
-    }
-
-    SRT_SRTLA_STATS stats;
-    memset(&stats, 0, sizeof(stats));
-    stats.valid = 1;
-    stats.version = version;
-    stats.numPeers = num_peers;
-    stats.totalBitrate = payload[1];
-    stats.timestamp = (static_cast<uint64_t>(payload[2]) << 32) | payload[3];
-
-    for (uint8_t i = 0; i < num_peers; i++)
-    {
-        const uint32_t* peer = payload + 4 + i * 7;
-        stats.peers[i].connectionId   = peer[0];
-        stats.peers[i].bitrate  = peer[1];
-        stats.peers[i].jitter   = peer[2];
-        stats.peers[i].bytesReceived  = (static_cast<uint64_t>(peer[3]) << 32) | peer[4];
-        stats.peers[i].uptime   = peer[5];
-        stats.peers[i].throughput = peer[6];
-    }
-
-    ScopedLock lock(m_SrtlaStatsLock);
-    m_SrtlaStats = stats;
 }
 
 void srt::CUDT::updateSrtRcvSettings()
@@ -10494,9 +10429,9 @@ int srt::CUDT::processData(CUnit* in_unit)
     // If the peer doesn't understand REXMIT flag, send rexmit request
     // always immediately.
     int initial_loss_ttl = 0;
-    if (m_config.srtlaPatches && m_bPeerRexmitFlag)
+    if (m_config.bSRTLA && m_bPeerRexmitFlag)
         initial_loss_ttl = m_config.iMaxReorderTolerance;
-    else if (!m_config.srtlaPatches && m_bPeerRexmitFlag)
+    else if (!m_config.bSRTLA && m_bPeerRexmitFlag)
         initial_loss_ttl = m_iReorderTolerance;
 
     // Track packet loss in statistics early, because a packet filter (e.g. FEC) might recover it later on,
@@ -10787,7 +10722,7 @@ int srt::CUDT::processData(CUnit* in_unit)
     if (m_bPeerRexmitFlag && was_sent_in_order)
     {
         ++m_iConsecOrderedDelivery;
-        if (!m_config.srtlaPatches && m_iConsecOrderedDelivery >= 50)
+        if (!m_config.bSRTLA && m_iConsecOrderedDelivery >= 50)
         {
             m_iConsecOrderedDelivery = 0;
             if (m_iReorderTolerance > 0)
@@ -10950,7 +10885,7 @@ void srt::CUDT::unlose(const CPacket &packet)
             HLOGC(qrlog.Debug, log << "... arrived at TTL " << had_ttl << " case " << m_iConsecEarlyDelivery);
 
             // After 10 consecutive
-            if (!m_config.srtlaPatches && m_iConsecEarlyDelivery >= 10)
+            if (!m_config.bSRTLA && m_iConsecEarlyDelivery >= 10)
             {
                 m_iConsecEarlyDelivery = 0;
                 if (m_iReorderTolerance > 0)
@@ -11534,7 +11469,7 @@ int srt::CUDT::checkNAKTimer(const steady_clock::time_point& currtime)
         if (currtime <= m_tsNextNAKTime.load())
             return BECAUSE_NO_REASON; // wait for next NAK time
 
-        if (m_config.srtlaPatches)
+        if (m_config.bSRTLA)
         {
             vector<int32_t> lossdata;
             {

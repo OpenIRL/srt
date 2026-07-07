@@ -67,6 +67,7 @@ namespace srt
 {
 class CChannel;
 class CUDT;
+class SrtlaRec;
 
 struct CUnit
 {
@@ -449,6 +450,10 @@ private:
     CChannel*     m_pChannel;  // The UDP channel for data sending
     sync::CTimer* m_pTimer;    // Timing facility
 
+    // SRTLA demux (borrowed pointer, owned by the multiplexer). NULL for a plain
+    // SRT muxer. Used by the send worker to fan SRT ACK/NAK out over all links.
+    SrtlaRec*     m_pSrtlaRec;
+
     sync::atomic<bool> m_bClosing;            // closing the worker
 
 public:
@@ -529,6 +534,10 @@ private:
     CChannel*     m_pChannel;   // UDP channel for receiving packets
     sync::CTimer* m_pTimer;     // shared timer with the snd queue
 
+    // SRTLA demux (borrowed pointer, owned by the multiplexer). NULL for a plain
+    // SRT muxer. Drives ingress classification and the periodic cleanup/stats pass.
+    SrtlaRec*     m_pSrtlaRec;
+
     int m_iIPversion;           // IP version
     size_t m_szPayloadSize;     // packet payload size
 
@@ -575,6 +584,7 @@ struct CMultiplexer
     CRcvQueue*    m_pRcvQueue; // The receiving queue
     CChannel*     m_pChannel;  // The UDP channel for sending and receiving
     sync::CTimer* m_pTimer;    // The timer
+    SrtlaRec*     m_pSrtlaRec;  // SRTLA demux for this muxer (owned), or NULL
 
     int m_iPort;      // The UDP port number of this multiplexer
     int m_iIPversion; // Address family (AF_INET or AF_INET6)
@@ -591,6 +601,7 @@ struct CMultiplexer
         , m_pRcvQueue(NULL)
         , m_pChannel(NULL)
         , m_pTimer(NULL)
+        , m_pSrtlaRec(NULL)
         , m_iPort(0)
         , m_iIPversion(0)
         , m_iRefCount(1)

@@ -890,11 +890,11 @@ struct CSrtConfigSetter<SRTO_RETRANSMITALGO>
 };
 
 template<>
-struct CSrtConfigSetter<SRTO_SRTLAPATCHES>
+struct CSrtConfigSetter<SRTO_SRTLA>
 {
     static void set(CSrtConfig& co, const void* optval, int optlen)
     {
-        co.srtlaPatches = cast_optval<bool>(optval, optlen);
+        co.bSRTLA = cast_optval<bool>(optval, optlen);
     }
 };
 
@@ -994,7 +994,7 @@ int dispatchSet(SRT_SOCKOPT optName, CSrtConfig& co, const void* optval, int opt
 #ifdef ENABLE_MAXREXMITBW
         DISPATCH(SRTO_MAXREXMITBW);
 #endif
-        DISPATCH(SRTO_SRTLAPATCHES)
+        DISPATCH(SRTO_SRTLA)
 
 #undef DISPATCH
     default:

@@ -84,6 +84,9 @@ struct CSrtMuxerConfig
     int  iIpToS;
     int  iIpV6Only;  // IPV6_V6ONLY option (-1 if not set)
     bool bReuseAddr; // reuse an exiting port or not, for UDP multiplexer
+    bool bSRTLA;     // SRTLA (SRT Link Aggregation): on a listener designates the SRTLA demux
+                     // muxer; inherited by accepted connections to enable multipath tuning.
+                     // (Set via SRTO_SRTLA.)
 
 #ifdef SRT_ENABLE_BINDTODEVICE
     std::string sBindToDevice;
@@ -99,6 +102,8 @@ struct CSrtMuxerConfig
         return CEQUAL(iIpTTL)
             && CEQUAL(iIpToS)
             && CEQUAL(bReuseAddr)
+            && CEQUAL(bSRTLA) // an SRTLA demux muxer must never merge with a plain SRT muxer
+
 #ifdef SRT_ENABLE_BINDTODEVICE
             && CEQUAL(sBindToDevice)
 #endif
@@ -119,6 +124,7 @@ struct CSrtMuxerConfig
         , iIpToS(-1) /* IPv4 Type of Service or IPv6 Traffic Class [0x00..0xff] (-1:undefined) */
         , iIpV6Only(-1)
         , bReuseAddr(true) // This is default in SRT
+        , bSRTLA(false)
         , iUDPSndBufSize(DEF_UDP_BUFFER_SIZE)
         , iUDPRcvBufSize(DEF_UDP_BUFFER_SIZE)
     {
@@ -265,8 +271,6 @@ struct CSrtConfig: CSrtMuxerConfig
     unsigned int uKmRefreshRatePkt;
     unsigned int uKmPreAnnouncePkt;
 
-    bool srtlaPatches;
-
     uint32_t uSrtVersion;
     uint32_t uMinimumPeerSrtVersion;
 
@@ -317,7 +321,6 @@ struct CSrtConfig: CSrtMuxerConfig
         , iMaxReorderTolerance(0) // Sensible optimal value is 10, 0 preserves old behavior
         , uKmRefreshRatePkt(0)
         , uKmPreAnnouncePkt(0)
-        , srtlaPatches(false)
         , uSrtVersion(SRT_DEF_VERSION)
         , uMinimumPeerSrtVersion(SRT_VERSION_MAJ1)
 
