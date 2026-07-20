@@ -281,6 +281,7 @@ struct CRcvFreshLoss
     int32_t                             seq[2];
     int                                 ttl;
     srt::sync::steady_clock::time_point timestamp;
+    srt::sync::steady_clock::time_point report_time; // last report time (zero = never); unused in plain SRT
 
     CRcvFreshLoss(int32_t seqlo, int32_t seqhi, int initial_ttl);
 
@@ -300,7 +301,8 @@ struct CRcvFreshLoss
     Emod revoke(int32_t sequence);
     Emod revoke(int32_t lo, int32_t hi);
 
-    static bool removeOne(std::deque<CRcvFreshLoss>& w_container, int32_t sequence, int* had_ttl = NULL);
+    static bool removeOne(std::deque<CRcvFreshLoss>& w_container, int32_t sequence, int* had_ttl = NULL,
+                          srt::sync::steady_clock::time_point* w_detect_time = NULL);
 };
 
 } // namespace srt

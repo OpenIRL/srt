@@ -137,3 +137,72 @@ TEST(CRcvFreshLossListTest, CheckFreshLossList)
     EXPECT_EQ(floss.size(), 4u);
 
 }
+
+/// A SPLIT must preserve the record's time history in both halves.
+TEST(CRcvFreshLossListTest, SplitPreservesTimeHistory)
+{
+    std::deque<CRcvFreshLoss> floss;
+    floss.push_back(CRcvFreshLoss(100, 120, 5));
+
+    // Simulate history: detected some time ago, reported later.
+    const srt::sync::steady_clock::time_point detected =
+        srt::sync::steady_clock::now() - srt::sync::milliseconds_from(400);
+    const srt::sync::steady_clock::time_point reported =
+        srt::sync::steady_clock::now() - srt::sync::milliseconds_from(150);
+    floss[0].timestamp   = detected;
+    floss[0].report_time = reported;
+
+    // SPLIT: sequence in the middle of the range.
+    int had_ttl = 0;
+    srt::sync::steady_clock::time_point detect_out;
+    const bool rm = CRcvFreshLoss::removeOne((floss), 110, &had_ttl, &detect_out);
+    ASSERT_TRUE(rm);
+    ASSERT_EQ(floss.size(), 2u);
+
+    // The out-parameter reports the ORIGINAL detection time.
+    EXPECT_EQ(detect_out, detected);
+
+    // Lower half keeps its history.
+    EXPECT_EQ(floss[0].seq[0], 100);
+    EXPECT_EQ(floss[0].seq[1], 109);
+    EXPECT_EQ(floss[0].timestamp, detected);
+    EXPECT_EQ(floss[0].report_time, reported);
+
+    // Upper half is a new object but must carry the same history.
+    EXPECT_EQ(floss[1].seq[0], 111);
+    EXPECT_EQ(floss[1].seq[1], 120);
+    EXPECT_EQ(floss[1].timestamp, detected);
+    EXPECT_EQ(floss[1].report_time, reported);
+    EXPECT_EQ(floss[1].ttl, floss[0].ttl);
+}
+
+/// STRIPPED/DELETE: history survives shrinking; detect-time out-param stays valid.
+TEST(CRcvFreshLossListTest, StripAndDeleteReportDetectTime)
+{
+    std::deque<CRcvFreshLoss> floss;
+    floss.push_back(CRcvFreshLoss(200, 202, 3));
+    const srt::sync::steady_clock::time_point detected =
+        srt::sync::steady_clock::now() - srt::sync::milliseconds_from(300);
+    floss[0].timestamp = detected;
+
+    srt::sync::steady_clock::time_point detect_out;
+
+    // STRIPPED (front): range shrinks, history stays.
+    ASSERT_TRUE(CRcvFreshLoss::removeOne((floss), 200, NULL, &detect_out));
+    EXPECT_EQ(detect_out, detected);
+    ASSERT_EQ(floss.size(), 1u);
+    EXPECT_EQ(floss[0].seq[0], 201);
+    EXPECT_EQ(floss[0].timestamp, detected);
+
+    // STRIPPED (back).
+    ASSERT_TRUE(CRcvFreshLoss::removeOne((floss), 202, NULL, &detect_out));
+    EXPECT_EQ(detect_out, detected);
+    ASSERT_EQ(floss.size(), 1u);
+    EXPECT_EQ(floss[0].seq[0], 201);
+    EXPECT_EQ(floss[0].seq[1], 201);
+
+    // DELETE (last element): detect time still reported although erased.
+    ASSERT_TRUE(CRcvFreshLoss::removeOne((floss), 201, NULL, &detect_out));
+    EXPECT_EQ(detect_out, detected);
+    EXPECT_TRUE(floss.empty());
+}

@@ -974,6 +974,16 @@ private: // Receiving related data
     SRT_ATTR_GUARDED_BY(m_RcvLossLock)
     std::deque<CRcvFreshLoss> m_FreshLoss;       //< Lost sequence already added to m_pRcvLossList, but not yet sent UMSG_LOSSREPORT for.
 
+    // SRTLA loss-report timing state (bSRTLA only).
+    sync::atomic<uint32_t> m_uiSrtlaHoldSteadyUs;
+    SRT_ATTR_GUARDED_BY(m_RcvLossLock)
+    uint32_t m_uiSrtlaHoldFastUs;
+    SRT_ATTR_GUARDED_BY(m_RcvLossLock)
+    sync::steady_clock::time_point m_tsSrtlaHoldFastSet;
+    sync::steady_clock::time_point m_tsSrtlaHoldPollTime;
+
+    uint32_t srtlaReorderHoldUs(const sync::steady_clock::time_point& now);
+
     int m_iReorderTolerance;                     //< Current value of dynamic reorder tolerance
     int m_iConsecEarlyDelivery;                  //< Increases with every OOO packet that came <TTL-2 time, resets with every increased reorder tolerance
     int m_iConsecOrderedDelivery;                //< Increases with every packet coming in order or retransmitted, resets with every out-of-order packet

@@ -747,6 +747,54 @@ void srt::SrtlaRec::doCleanup(const time_point& now)
     }
 }
 
+uint32_t srt::SrtlaRec::holdSteadyUs(SRTSOCKET socket_id)
+{
+    ScopedLock lock(m_Lock);
+
+    Group* grp = NULL;
+    for (std::list<Group>::iterator g = m_Groups.begin(); g != m_Groups.end(); ++g)
+    {
+        if (g->bound && g->socket_id == socket_id)
+        {
+            grp = &*g;
+            break;
+        }
+    }
+    if (!grp)
+        return 0;
+
+    double tmin = 0.0, tmax = 0.0, jmax = 0.0;
+    bool   have = false;
+    for (std::list<Link>::iterator it = grp->links.begin(); it != grp->links.end(); ++it)
+    {
+        if (!it->transit_valid)
+            continue;
+        if (!have)
+        {
+            tmin = tmax = it->transit_ewma;
+            have = true;
+        }
+        else
+        {
+            if (it->transit_ewma < tmin)
+                tmin = it->transit_ewma;
+            if (it->transit_ewma > tmax)
+                tmax = it->transit_ewma;
+        }
+        if (it->jitter_ewma > jmax)
+            jmax = it->jitter_ewma;
+    }
+    if (!have)
+        return 0;
+
+    double hold = (tmax - tmin) + 4.0 * jmax;
+    if (hold < 0.0)
+        hold = 0.0;
+    if (hold > 10e6)
+        hold = 10e6;
+    return (uint32_t)hold;
+}
+
 // Fill @a out with the group's live per-link EWMA values (read fresh); rates get a
 // read-time decay so they are current at this instant.
 bool srt::SrtlaRec::fillStats(SRTSOCKET socket_id, SRT_SRTLA_STATS* out)

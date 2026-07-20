@@ -262,6 +262,27 @@ CUDTUnited& srt::CUDT::uglobal()
 
 #endif
 
+// SRTLA loss-report timing parameters (active only with SRTO_SRTLA).
+namespace {
+const int      SRTLA_WITNESS_TTL             = 2;
+const uint32_t SRTLA_HOLD_FLOOR_US           = 100000;
+const uint32_t SRTLA_HOLD_CAP_US             = 500000;
+const uint32_t SRTLA_HOLD_FALLBACK_US        = 250000;
+const uint32_t SRTLA_HOLD_EVIDENCE_MARGIN_US = 30000;
+const int64_t  SRTLA_HOLD_DECAY_TAU_US       = 20000000;
+const double   SRTLA_RENAK_RTT_FACTOR        = 1.3;
+const int      SRTLA_MIN_RCVLATENCY_MS       = 1000;
+
+inline uint32_t srtlaDecayedFastHold(uint32_t stored_us, int64_t age_us)
+{
+    if (stored_us == 0 || age_us >= SRTLA_HOLD_DECAY_TAU_US)
+        return 0;
+    if (age_us <= 0)
+        return stored_us;
+    return (uint32_t)((int64_t)stored_us * (SRTLA_HOLD_DECAY_TAU_US - age_us) / SRTLA_HOLD_DECAY_TAU_US);
+}
+} // namespace
+
 void srt::CUDT::construct()
 {
     m_pSndBuffer           = NULL;
@@ -269,6 +290,8 @@ void srt::CUDT::construct()
     m_pSndLossList         = NULL;
     m_pRcvLossList         = NULL;
     m_iReorderTolerance    = 0;
+    m_uiSrtlaHoldSteadyUs  = 0;
+    m_uiSrtlaHoldFastUs    = 0;
     // How many times so far the packet considered lost has been received
     // before TTL expires.
     m_iConsecEarlyDelivery   = 0; 
@@ -379,6 +402,8 @@ srt::CUDT::CUDT(CUDTSocket* parent, const CUDT& ancestor)
     m_SrtHsSide         = ancestor.m_SrtHsSide; // actually it sets it to HSD_RESPONDER
     m_bTLPktDrop        = ancestor.m_bTLPktDrop;
     m_iReorderTolerance = m_config.iMaxReorderTolerance;  // Initialize with maximum value
+    if (m_config.bSRTLA && m_config.iRcvLatency < SRTLA_MIN_RCVLATENCY_MS)
+        m_config.iRcvLatency = SRTLA_MIN_RCVLATENCY_MS; // SRTLA minimum receiver latency
 
     // Runtime
     m_pCache = ancestor.m_pCache;
@@ -10430,7 +10455,7 @@ int srt::CUDT::processData(CUnit* in_unit)
     // always immediately.
     int initial_loss_ttl = 0;
     if (m_config.bSRTLA && m_bPeerRexmitFlag)
-        initial_loss_ttl = m_config.iMaxReorderTolerance;
+        initial_loss_ttl = SRTLA_WITNESS_TTL;
     else if (!m_config.bSRTLA && m_bPeerRexmitFlag)
         initial_loss_ttl = m_iReorderTolerance;
 
@@ -10676,6 +10701,19 @@ int srt::CUDT::processData(CUnit* in_unit)
         {
             deque<CRcvFreshLoss>::iterator i = m_FreshLoss.begin();
 
+            if (m_config.bSRTLA)
+            {
+                // SRTLA: reports are driven from checkNAKTimer(); records
+                // persist until recovered or dropped.
+                for (; i != m_FreshLoss.end(); ++i)
+                {
+                    if (i->ttl > 0)
+                        --i->ttl;
+                }
+            }
+            else
+            {
+
             // Phase 1: take while TTL <= 0.
             // There can be more than one record with the same TTL, if it has happened before
             // that there was an 'unlost' (@c dropFromLossLists) sequence that has split one detected loss
@@ -10708,6 +10746,8 @@ int srt::CUDT::processData(CUnit* in_unit)
             // Phase 2: rest of the records should have TTL decreased.
             for (; i != m_FreshLoss.end(); ++i)
                 --i->ttl;
+
+            }
         }
     }
     if (!lossdata.empty())
@@ -10808,6 +10848,31 @@ void srt::CUDT::updateIdleLinkFrom(CUDT* source)
 /// do not include the lacking packet.
 /// The tolerance is not increased infinitely - it's bordered by iMaxReorderTolerance.
 /// This value can be set in options - SRT_LOSSMAXTTL.
+// Caller holds m_RcvLossLock.
+uint32_t srt::CUDT::srtlaReorderHoldUs(const steady_clock::time_point& now)
+{
+    uint32_t steady_us = m_uiSrtlaHoldSteadyUs.load();
+    if (steady_us == 0)
+        steady_us = SRTLA_HOLD_FALLBACK_US;
+
+    const uint32_t fast_us = srtlaDecayedFastHold(m_uiSrtlaHoldFastUs,
+            count_microseconds(now - m_tsSrtlaHoldFastSet));
+    if (fast_us == 0)
+        m_uiSrtlaHoldFastUs = 0;
+
+    uint32_t hold = std::max(steady_us, fast_us);
+    if (hold < SRTLA_HOLD_FLOOR_US)
+        hold = SRTLA_HOLD_FLOOR_US;
+
+    uint32_t cap = SRTLA_HOLD_CAP_US;
+    const uint32_t lat_half_us = (uint32_t)m_iTsbPdDelay_ms * 500;
+    if (lat_half_us > 0 && lat_half_us < cap)
+        cap = lat_half_us;
+    if (hold > cap)
+        hold = cap;
+    return hold;
+}
+
 void srt::CUDT::unlose(const CPacket &packet)
 {
     ScopedLock lg(m_RcvLossLock);
@@ -10863,13 +10928,33 @@ void srt::CUDT::unlose(const CPacket &packet)
     //   (in this case it's empty anyway)
     // - decrease current reorder tolerance based on whether packets come in order
     //   (current reorder tolerance is 0 anyway)
-    if (m_bPeerRexmitFlag == 0 || m_iReorderTolerance == 0)
+    if (m_bPeerRexmitFlag == 0 || (!m_config.bSRTLA && m_iReorderTolerance == 0))
         return;
 
     int had_ttl = 0;
-    if (CRcvFreshLoss::removeOne((m_FreshLoss), sequence, (&had_ttl)))
+    steady_clock::time_point detect_time;
+    if (CRcvFreshLoss::removeOne((m_FreshLoss), sequence, (&had_ttl), (&detect_time)))
     {
         HLOGC(qrlog.Debug, log << "sequence " << sequence << " removed from belated lossreport record");
+
+        if (m_config.bSRTLA && was_reordered && !is_zero(detect_time))
+        {
+            const int64_t late_us = count_microseconds(steady_clock::now() - detect_time);
+            if (late_us > 0)
+            {
+                const uint32_t want_us = (uint32_t)std::min<int64_t>(late_us + SRTLA_HOLD_EVIDENCE_MARGIN_US, SRTLA_HOLD_CAP_US);
+                const uint32_t cur_fast_us = srtlaDecayedFastHold(m_uiSrtlaHoldFastUs,
+                        count_microseconds(steady_clock::now() - m_tsSrtlaHoldFastSet));
+                if (want_us > cur_fast_us)
+                {
+                    HLOGC(qrlog.Debug, log << CONID() << "SRTLA: belated original %" << sequence
+                            << " late by " << (late_us / 1000) << "ms - raising reorder hold to "
+                            << (want_us / 1000) << "ms");
+                    m_uiSrtlaHoldFastUs = want_us;
+                    m_tsSrtlaHoldFastSet = steady_clock::now();
+                }
+            }
+        }
     }
 
     if (was_reordered)
@@ -11469,60 +11554,39 @@ int srt::CUDT::checkNAKTimer(const steady_clock::time_point& currtime)
         if (currtime <= m_tsNextNAKTime.load())
             return BECAUSE_NO_REASON; // wait for next NAK time
 
-        if (m_config.bSRTLA)
+        if (m_config.bSRTLA && m_bPeerRexmitFlag)
         {
+            // SRTLA: time-gated loss reporting (single emitter for first
+            // reports and repeats).
+            if (count_microseconds(currtime - m_tsSrtlaHoldPollTime) >= 1000000)
+            {
+                m_tsSrtlaHoldPollTime = currtime;
+                if (m_pRcvQueue && m_pRcvQueue->m_pSrtlaRec)
+                    m_uiSrtlaHoldSteadyUs.store(m_pRcvQueue->m_pSrtlaRec->holdSteadyUs(m_SocketID));
+            }
+
             vector<int32_t> lossdata;
             {
                 ScopedLock lk(m_RcvLossLock);
-                const int cap = m_iMaxSRTPayloadSize / 4;
-                int32_t* arr = new int32_t[cap];
-                int arrlen = 0;
-                m_pRcvLossList->getLossArray(arr, arrlen, cap);
-                const steady_clock::duration max_age = milliseconds_from(250);
-                for (int n = 0; n < arrlen; )
+                const uint32_t hold_us    = srtlaReorderHoldUs(currtime);
+                const int64_t  srtt_us    = m_iSRTT.load();
+                const int64_t  spacing_us = std::max<int64_t>(
+                        (int64_t)(SRTLA_RENAK_RTT_FACTOR * (double)srtt_us),
+                        count_microseconds(m_tdNAKInterval));
+                const size_t cap = (size_t)m_iMaxSRTPayloadSize / 4;
+                for (deque<CRcvFreshLoss>::iterator i = m_FreshLoss.begin();
+                     i != m_FreshLoss.end() && lossdata.size() + 2 <= cap; ++i)
                 {
-                    int32_t lo, hi;
-                    if (arr[n] & LOSSDATA_SEQNO_RANGE_FIRST)
-                    {
-                        lo = arr[n] & ~LOSSDATA_SEQNO_RANGE_FIRST;
-                        hi = arr[n + 1];
-                        n += 2;
-                    }
-                    else
-                    {
-                        lo = hi = arr[n];
-                        n += 1;
-                    }
-                    int32_t runStart = SRT_SEQNO_NONE;
-                    for (int32_t s = lo; ; s = CSeqNo::incseq(s))
-                    {
-                        bool fresh = false;
-                        for (size_t k = 0; k < m_FreshLoss.size(); ++k)
-                        {
-                            if (CSeqNo::seqcmp(s, m_FreshLoss[k].seq[0]) >= 0 && CSeqNo::seqcmp(s, m_FreshLoss[k].seq[1]) <= 0)
-                            {
-                                if (currtime - m_FreshLoss[k].timestamp < max_age)
-                                    fresh = true;
-                                break;
-                            }
-                        }
-                        if (!fresh)
-                        {
-                            if (runStart == SRT_SEQNO_NONE)
-                                runStart = s;
-                        }
-                        else if (runStart != SRT_SEQNO_NONE)
-                        {
-                            addLossRecord(lossdata, runStart, CSeqNo::decseq(s));
-                            runStart = SRT_SEQNO_NONE;
-                        }
-                        if (s == hi)
-                            break;
-                    }
-                    if (runStart != SRT_SEQNO_NONE)
-                        addLossRecord(lossdata, runStart, hi);
+                    if (i->ttl > 0)
+                        continue;
+                    if (count_microseconds(currtime - i->timestamp) < (int64_t)hold_us)
+                        continue;
+                    if (!is_zero(i->report_time)
+                            && count_microseconds(currtime - i->report_time) < spacing_us)
+                        continue;
+                    addLossRecord(lossdata, i->seq[0], i->seq[1]);
+                    i->report_time = currtime;
                 }
-                delete[] arr;
             }
             if (!lossdata.empty())
             {

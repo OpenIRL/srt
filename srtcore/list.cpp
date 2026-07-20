@@ -817,6 +817,7 @@ void srt::CRcvLossList::getLossArray(int32_t* array, int& len, int limit)
 srt::CRcvFreshLoss::CRcvFreshLoss(int32_t seqlo, int32_t seqhi, int initial_age)
     : ttl(initial_age)
     , timestamp(steady_clock::now())
+    , report_time() // zero: never reported yet
 {
     seq[0] = seqlo;
     seq[1] = seqhi;
@@ -897,7 +898,8 @@ srt::CRcvFreshLoss::Emod srt::CRcvFreshLoss::revoke(int32_t lo, int32_t hi)
     return DELETE;
 }
 
-bool srt::CRcvFreshLoss::removeOne(std::deque<CRcvFreshLoss>& w_container, int32_t sequence, int* pw_had_ttl)
+bool srt::CRcvFreshLoss::removeOne(std::deque<CRcvFreshLoss>& w_container, int32_t sequence, int* pw_had_ttl,
+                                   srt::sync::steady_clock::time_point* pw_detect_time)
 {
     for (size_t i = 0; i < w_container.size(); ++i)
     {
@@ -906,6 +908,10 @@ bool srt::CRcvFreshLoss::removeOne(std::deque<CRcvFreshLoss>& w_container, int32
 
         if (wh == NONE)
             continue;  // Not found. Search again.
+
+        // Read before a possible erase below; revoke() never touches the timestamp.
+        if (pw_detect_time)
+            *pw_detect_time = w_container[i].timestamp;
 
         if (wh == DELETE)   //  ... oo ... x ... o ... => ... oo ... o ...
         {
@@ -927,8 +933,11 @@ bool srt::CRcvFreshLoss::removeOne(std::deque<CRcvFreshLoss>& w_container, int32
 
             // Use position of the NEXT element because insertion happens BEFORE pointed element.
             // Use the same TTL (will stay the same in the other one).
-            w_container.insert(w_container.begin() + i + 1,
-                    CRcvFreshLoss(next_begin, next_end, w_container[i].ttl));
+            // Both halves keep the original time history.
+            CRcvFreshLoss upper(next_begin, next_end, w_container[i].ttl);
+            upper.timestamp   = w_container[i].timestamp;
+            upper.report_time = w_container[i].report_time;
+            w_container.insert(w_container.begin() + i + 1, upper);
         }
         // For STRIPPED:  ... xooo ... => ... ooo ...
         // i.e. there's nothing to do.

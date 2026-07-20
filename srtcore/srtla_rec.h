@@ -113,6 +113,10 @@ public:
     /// Returns true (out.valid = 1) if such a group exists.
     bool fillStats(SRTSOCKET socket_id, SRT_SRTLA_STATS* out);
 
+    /// Link-timing summary for the group bound to @a socket_id, in
+    /// microseconds. Returns 0 while no valid measurement exists.
+    uint32_t holdSteadyUs(SRTSOCKET socket_id);
+
 private:
     typedef sync::steady_clock::time_point time_point;
 
