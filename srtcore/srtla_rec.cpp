@@ -240,12 +240,17 @@ void srt::SrtlaRec::sendKeepalive(const sockaddr_any& dst)
 // SRT data sequence numbers (big-endian, as received).
 void srt::SrtlaRec::sendSrtlaAck(const sockaddr_any& dst, Link& l)
 {
+    if (l.ack_count <= 0)
+        return;
+
+    // Variable-length ACK: header word + one word per pending SN.
     uint8_t buf[SRTLA_ACK_LEN];
-    memset(buf, 0, sizeof buf);
     store_be32(buf, uint32_t(T_SRTLA_ACK) << 16); // 0x91000000
-    for (int i = 0; i < RECV_ACK_INT; ++i)
+    const int n = l.ack_count;
+    for (int i = 0; i < n; ++i)
         store_be32(buf + 4 + 4 * i, l.ack_log[i]);
-    m_pChannel->sendtoRaw(dst, (const char*)buf, SRTLA_ACK_LEN);
+    m_pChannel->sendtoRaw(dst, (const char*)buf, 4 + 4 * (size_t)n);
+    l.ack_count = 0;
 }
 
 // Echo a received keepalive verbatim, padded to at least MIN_PAD (spec §3.4).
@@ -569,11 +574,14 @@ srt::SrtlaRec::Ingress srt::SrtlaRec::onIngress(const sockaddr_any& src, CUnit* 
             l->have_prev_transit = true;
         }
 
+        if (l->ack_count == 0)
+            l->ack_first_pending = now;
         l->ack_log[l->ack_count++] = uint32_t(sn);
-        if (l->ack_count >= RECV_ACK_INT)
+        // Flush on a full batch or when the oldest pending entry has aged out.
+        if (l->ack_count >= RECV_ACK_INT
+                || count_microseconds(now - l->ack_first_pending) >= ACK_FLUSH_US)
         {
             sendSrtlaAck(src, *l);
-            l->ack_count = 0;
         }
     }
 
@@ -656,6 +664,16 @@ void srt::SrtlaRec::onPeriodic(const time_point& now)
         m_LastCleanup = now;
         m_HaveTimers  = true;
         return;
+    }
+
+    // Flush aged partial SRTLA-ACK batches (covers links that went quiet).
+    for (std::list<Group>::iterator g = m_Groups.begin(); g != m_Groups.end(); ++g)
+    {
+        for (std::list<Link>::iterator it = g->links.begin(); it != g->links.end(); ++it)
+        {
+            if (it->ack_count > 0 && count_microseconds(now - it->ack_first_pending) >= ACK_FLUSH_US)
+                sendSrtlaAck(it->addr, *it);
+        }
     }
 
     if (count_milliseconds(now - m_LastCleanup) >= 3000) // CLEANUP_PERIOD

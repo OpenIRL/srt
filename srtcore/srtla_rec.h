@@ -60,7 +60,8 @@ public:
     static const size_t   SRTLA_ACK_LEN        = 44; // header word + 10 SNs
     static const size_t   SRT_MIN_LEN          = 16; // min length treated as an SRT packet
     static const size_t   MIN_PAD              = 32; // short control packets padded to this
-    static const int      RECV_ACK_INT         = 10; // SRT data packets per SRTLA ACK
+    static const int      RECV_ACK_INT         = 10; // SRT data packets per SRTLA ACK (batch cap)
+    static const int64_t  ACK_FLUSH_US         = 30000; // partial-batch flush age
     static const size_t   MAX_CONNS_PER_GROUP  = 16; // == SRT_SRTLA_MAX_PEERS
     static const size_t   MAX_GROUPS           = 200;
     static const int32_t  SN_WINDOW_SIZE       = 65536; // retransmission-tracking bitmap
@@ -125,8 +126,9 @@ private:
         bool         recovering;
 
         // SRTLA-ACK batch: raw 31-bit SNs in receive order (spec §3.5).
-        uint32_t ack_log[RECV_ACK_INT];
-        int      ack_count;
+        uint32_t   ack_log[RECV_ACK_INT];
+        int        ack_count;
+        time_point ack_first_pending; // when the oldest unsent entry was queued
 
         uint32_t connectionId;         // FNV-1a of addr+port
 
