@@ -1435,6 +1435,19 @@ inline bool checkMappedIPv4(const sockaddr_in6& sa)
     return checkMappedIPv4(addr);
 }
 
+/// Share of the traffic in a sampled window that was not impaired, in percent.
+/// @param clean    packets that made it through on the first attempt
+/// @param impaired packets that were lost, retransmitted or dropped
+/// @return 100 for an empty window, 0 when nothing came through cleanly
+inline double StatsQualityPct(int64_t clean, int64_t impaired)
+{
+    const int64_t total = clean + impaired;
+    if (total <= 0)
+        return 100.0;
+
+    return (100.0 * clean) / total;
+}
+
 std::string FormatLossArray(const std::vector< std::pair<int32_t, int32_t> >& lra);
 std::ostream& PrintEpollEvent(std::ostream& os, int events, int et_events = 0);
 

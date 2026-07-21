@@ -1088,6 +1088,13 @@ private: // Generation and processing of packets
     int  sendCtrlAck(CPacket& ctrlpkt, int size);
     void sendLossReport(const std::vector< std::pair<int32_t, int32_t> >& losslist);
 
+    /// Record packets that are being requested back for the first time, that is,
+    /// that were still missing once the reorder grace period was over. Feeds
+    /// pctRcvQuality. NAK repeats must not be passed here.
+    /// Takes m_StatsLock, so the caller must not hold it.
+    /// @param pkts  number of sequence numbers confirmed as lost
+    void countConfirmedLoss(int pkts);
+
     void processCtrl(const CPacket& ctrlpkt);
 
     /// @brief Process incoming control ACK packet.
@@ -1209,7 +1216,23 @@ private: // Trace
         int64_t sndDuration;                // real time for sending
         time_point sndDurationCounter;      // timers to record the sending Duration
 
+        // Quality sampling window. Rolled on a fixed cadence by the timer thread
+        // (not by a reader), so the reported percentages describe the last
+        // completed window and stay identical for every read within it.
+        time_point tsQualityWindow;         // start of the window currently filling
+        int64_t qualBaseSndClean;           // cumulative counters snapshotted at window start
+        int64_t qualBaseSndImpaired;
+        int64_t qualBaseRcvClean;
+        int64_t qualBaseRcvImpaired;
+        double  pctSndQuality;              // last completed window, percent
+        double  pctRcvQuality;
+
     } m_stats;
+
+    /// Roll the quality sampling window if it is due, and recompute the
+    /// percentages from what accumulated inside it. Called from the timer
+    /// thread; takes m_StatsLock.
+    void updateQualityWindow(const time_point& currtime);
 
 public:
     static const int SELF_CLOCK_INTERVAL = 64;  // ACK interval for self-clocking

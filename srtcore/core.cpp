@@ -273,6 +273,9 @@ const int64_t  SRTLA_HOLD_DECAY_TAU_US       = 20000000;
 const double   SRTLA_RENAK_RTT_FACTOR        = 1.3;
 const int      SRTLA_MIN_RCVLATENCY_MS       = 1000;
 
+// Sampling window for pctSndQuality / pctRcvQuality.
+const int64_t  QUALITY_WINDOW_US             = 1000000; // 1 s
+
 inline uint32_t srtlaDecayedFastHold(uint32_t stored_us, int64_t age_us)
 {
     if (stored_us == 0 || age_us >= SRTLA_HOLD_DECAY_TAU_US)
@@ -964,6 +967,14 @@ void srt::CUDT::clearData()
         m_stats.traceReorderDistance = 0;
         m_stats.traceBelatedTime = 0;
         m_stats.sndDuration = m_stats.m_sndDurationTotal = 0;
+
+        m_stats.tsQualityWindow      = m_stats.tsStartTime;
+        m_stats.qualBaseSndClean     = 0;
+        m_stats.qualBaseSndImpaired  = 0;
+        m_stats.qualBaseRcvClean     = 0;
+        m_stats.qualBaseRcvImpaired  = 0;
+        m_stats.pctSndQuality        = 100.0;
+        m_stats.pctRcvQuality        = 100.0;
     }
 
     // Resetting these data because this happens when agent isn't connected.
@@ -7548,6 +7559,7 @@ void srt::CUDT::bstats(CBytePerfMon *perf, bool clear, bool instantaneous)
 
         perf->pktSndLoss           = m_stats.sndr.lost.trace.count();
         perf->pktRcvLoss           = m_stats.rcvr.lost.trace.count();
+        perf->pktRcvLossConfirmed  = m_stats.rcvr.lostConfirmed.trace.count();
         perf->pktRetrans           = m_stats.sndr.sentRetrans.trace.count();
         perf->pktRcvRetrans        = m_stats.rcvr.recvdRetrans.trace.count();
         perf->pktSentACK           = m_stats.rcvr.sentAck.trace.count();
@@ -7586,6 +7598,7 @@ void srt::CUDT::bstats(CBytePerfMon *perf, bool clear, bool instantaneous)
         perf->pktRecvUniqueTotal = m_stats.rcvr.recvdUnique.total.count();
         perf->pktSndLossTotal    = m_stats.sndr.lost.total.count();
         perf->pktRcvLossTotal    = m_stats.rcvr.lost.total.count();
+        perf->pktRcvLossConfirmedTotal = m_stats.rcvr.lostConfirmed.total.count();
         perf->pktRetransTotal    = m_stats.sndr.sentRetrans.total.count();
         perf->pktSentACKTotal    = m_stats.rcvr.sentAck.total.count();
         perf->pktRecvACKTotal    = m_stats.sndr.recvdAck.total.count();
@@ -7628,6 +7641,12 @@ void srt::CUDT::bstats(CBytePerfMon *perf, bool clear, bool instantaneous)
         perf->mbpsMaxBW = m_config.llMaxBW > 0 ? Bps2Mbps(m_config.llMaxBW)
                         : m_CongCtl.ready()    ? Bps2Mbps(m_CongCtl->sndBandwidth())
                                                 : 0;
+
+        // Last completed sampling window, maintained by the timer thread. Read
+        // only - independent of @a clear and of the caller's polling cadence, so
+        // repeated reads inside one window all yield the same value.
+        perf->pctSndQuality = m_stats.pctSndQuality;
+        perf->pctRcvQuality = m_stats.pctRcvQuality;
 
         if (clear)
         {
@@ -9989,12 +10008,23 @@ void srt::CUDT::processClose()
     CGlobEvent::triggerEvent();
 }
 
+void srt::CUDT::countConfirmedLoss(int pkts)
+{
+    if (pkts <= 0)
+        return;
+
+    ScopedLock lg(m_StatsLock);
+    m_stats.rcvr.lostConfirmed.count(stats::Packets((uint32_t) pkts));
+}
+
 void srt::CUDT::sendLossReport(const std::vector<std::pair<int32_t, int32_t> > &loss_seqs)
 {
+    int confirmed = 0;
     vector<int32_t> seqbuffer;
     seqbuffer.reserve(2 * loss_seqs.size()); // pessimistic
     for (loss_seqs_t::const_iterator i = loss_seqs.begin(); i != loss_seqs.end(); ++i)
     {
+        confirmed += CSeqNo::seqoff(i->first, i->second) + 1;
         if (i->first == i->second)
         {
             seqbuffer.push_back(i->first);
@@ -10012,6 +10042,7 @@ void srt::CUDT::sendLossReport(const std::vector<std::pair<int32_t, int32_t> > &
     if (!seqbuffer.empty())
     {
         sendCtrl(UMSG_LOSSREPORT, NULL, &seqbuffer[0], (int) seqbuffer.size());
+        countConfirmedLoss(confirmed);
     }
 }
 
@@ -10692,6 +10723,7 @@ int srt::CUDT::processData(CUnit* in_unit)
     // can be quite well optimized.
 
     vector<int32_t> lossdata;
+    int             confirmed_loss = 0;
     {
         ScopedLock lg(m_RcvLossLock);
 
@@ -10723,6 +10755,7 @@ int srt::CUDT::processData(CUnit* in_unit)
                 HLOGC(qrlog.Debug, log << "Packet seq " << i->seq[0] << "-" << i->seq[1]
                         << " (" << (CSeqNo::seqoff(i->seq[0], i->seq[1]) + 1) << " packets) considered lost - sending LOSSREPORT");
                 addLossRecord(lossdata, i->seq[0], i->seq[1]);
+                confirmed_loss += CSeqNo::seqoff(i->seq[0], i->seq[1]) + 1;
             }
 
             // Remove elements that have been processed and prepared for lossreport.
@@ -10754,6 +10787,7 @@ int srt::CUDT::processData(CUnit* in_unit)
     {
         sendCtrl(UMSG_LOSSREPORT, NULL, &lossdata[0], (int) lossdata.size());
     }
+    countConfirmedLoss(confirmed_loss);
 
     // was_sent_in_order means either of:
     // - packet was sent in order (first if branch above)
@@ -11566,6 +11600,7 @@ int srt::CUDT::checkNAKTimer(const steady_clock::time_point& currtime)
             }
 
             vector<int32_t> lossdata;
+            int             confirmed_loss = 0;
             {
                 ScopedLock lk(m_RcvLossLock);
                 const uint32_t hold_us    = srtlaReorderHoldUs(currtime);
@@ -11585,12 +11620,15 @@ int srt::CUDT::checkNAKTimer(const steady_clock::time_point& currtime)
                             && count_microseconds(currtime - i->report_time) < spacing_us)
                         continue;
                     addLossRecord(lossdata, i->seq[0], i->seq[1]);
+                    if (is_zero(i->report_time)) // first report for this record, not a repeat
+                        confirmed_loss += CSeqNo::seqoff(i->seq[0], i->seq[1]) + 1;
                     i->report_time = currtime;
                 }
             }
             if (!lossdata.empty())
             {
                 sendCtrl(UMSG_LOSSREPORT, NULL, &lossdata[0], (int)lossdata.size());
+                countConfirmedLoss(confirmed_loss);
                 debug_decision = BECAUSE_NAKREPORT;
             }
         }
@@ -11779,12 +11817,39 @@ void srt::CUDT::checkRexmitTimer(const steady_clock::time_point& currtime)
     m_pSndQueue->m_pSndUList->update(this, CSndUList::DONT_RESCHEDULE);
 }
 
+void srt::CUDT::updateQualityWindow(const steady_clock::time_point& currtime)
+{
+    ScopedLock stat_lock(m_StatsLock);
+
+    if (count_microseconds(currtime - m_stats.tsQualityWindow) < QUALITY_WINDOW_US)
+        return;
+
+    const int64_t snd_clean    = m_stats.sndr.sentUnique.total.count();
+    const int64_t snd_impaired = m_stats.sndr.sentRetrans.total.count()
+                               + m_stats.sndr.dropped.total.count();
+    const int64_t rcv_clean    = m_stats.rcvr.recvdUnique.total.count();
+    const int64_t rcv_impaired = m_stats.rcvr.lostConfirmed.total.count();
+
+    m_stats.pctSndQuality = StatsQualityPct(snd_clean - m_stats.qualBaseSndClean,
+                                            snd_impaired - m_stats.qualBaseSndImpaired);
+    m_stats.pctRcvQuality = StatsQualityPct(rcv_clean - m_stats.qualBaseRcvClean,
+                                            rcv_impaired - m_stats.qualBaseRcvImpaired);
+
+    m_stats.qualBaseSndClean    = snd_clean;
+    m_stats.qualBaseSndImpaired = snd_impaired;
+    m_stats.qualBaseRcvClean    = rcv_clean;
+    m_stats.qualBaseRcvImpaired = rcv_impaired;
+    m_stats.tsQualityWindow     = currtime;
+}
+
 void srt::CUDT::checkTimers()
 {
     // update CC parameters
     updateCC(TEV_CHECKTIMER, EventVariant(TEV_CHT_INIT));
 
     const steady_clock::time_point currtime = steady_clock::now();
+
+    updateQualityWindow(currtime);
 
     // This is a very heavy log, unblock only for temporary debugging!
 #if 0

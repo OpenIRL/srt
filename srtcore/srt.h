@@ -406,6 +406,21 @@ struct CBytePerfMon
    int64_t  pktRecvUnique;              // number of packets to be received by the application
    uint64_t byteSentUnique;             // number of data bytes, sent by the application
    uint64_t byteRecvUnique;             // number of data bytes to be received by the application
+
+   // Packets that were still missing once the reorder grace period was over and were
+   // therefore requested back. Unlike pktRcvLoss (a sequence discontinuity metric per
+   // RFC 4737, which counts reordering as loss and never takes it back), this counts
+   // only losses the receiver itself concluded were real. NAK repeats are not counted.
+   int      pktRcvLossConfirmedTotal;   // total number of packets confirmed as lost (receiver side)
+   int      pktRcvLossConfirmed;        // number of packets confirmed as lost (receiver side)
+
+   // Share of the traffic that was not impaired, in percent (100 = clean, 0 = nothing
+   // got through), over the last completed one-second sampling window. The window is
+   // rolled internally on its own cadence, so these are independent of @a clear and of
+   // how often the caller polls: every read inside the same window returns the same
+   // value. Both are 100 for an idle window.
+   double   pctSndQuality;              // 100 * pktSentUnique / (pktSentUnique + pktRetrans + pktSndDrop)
+   double   pctRcvQuality;              // 100 * pktRecvUnique / (pktRecvUnique + pktRcvLossConfirmed)
 };
 
 ////////////////////////////////////////////////////////////////////////////////

@@ -2549,6 +2549,12 @@ void CUDTGroup::bstatsSocket(CBytePerfMon* perf, bool clear)
     perf->mbpsSendRate    = double(perf->byteSent) * 8.0 / interval;
     perf->mbpsRecvRate    = double(perf->byteRecv) * 8.0 / interval;
 
+    // The group keeps no loss counters of its own - loss is a per-member property,
+    // and so is the sampling window that backs these. Report a clean window and
+    // let the caller query the member sockets for the real thing.
+    perf->pctSndQuality = 100.0;
+    perf->pctRcvQuality = 100.0;
+
     if (clear)
     {
         m_stats.reset();
