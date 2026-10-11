@@ -108,6 +108,10 @@ public:
     /// reverse path can find the group.
     void bindGroup(const sockaddr_any& peer, CUDT* u);
 
+    /// The connection @a socket_id has left the receive queue (closed or broken): release
+    /// its group, which from then on times out like any other once its links are gone.
+    void unbindSocket(SRTSOCKET socket_id);
+
     /// Periodic pass (receive worker timing section): link/group timeouts and recovery
     /// keepalives. Internally throttled.
     void onPeriodic(const sync::steady_clock::time_point& now);
@@ -258,6 +262,7 @@ private:
 
     // --- accounting helpers ---
     bool trackSn(Group& g, int32_t sn);            // returns true if unique (first seen)
+    void resetAccounting(Group& g);                // new connection bound: forget the old one's
 
     // --- cleanup ---
     void doCleanup(const time_point& now);

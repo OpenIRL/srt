@@ -1352,6 +1352,9 @@ void* srt::CRcvQueue::worker(void* param)
                       log << CUDTUnited::CONID(u->m_SocketID) << " SOCKET broken, REMOVING FROM RCV QUEUE/MAP.");
                 // the socket must be removed from Hash table first, then RcvUList
                 self->m_pHash->remove(u->m_SocketID);
+                // SRTLA: a group bound to this connection was kept while it lived; let it go.
+                if (self->m_pSrtlaRec)
+                    self->m_pSrtlaRec->unbindSocket(u->m_SocketID);
                 self->m_pRcvUList->remove(u);
                 u->m_pRNode->m_bOnList = false;
             }

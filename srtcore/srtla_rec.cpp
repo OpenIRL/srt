@@ -528,7 +528,11 @@ srt::SrtlaRec::Ingress srt::SrtlaRec::onIngress(const sockaddr_any& src, CUnit* 
         // Count first-seen (group-wide) sequence numbers as unique. First-seen tracking,
         // not the rexmit flag: a retransmit the receiver never got is still new.
         const int32_t sn     = int32_t(w0 & 0x7FFFFFFF);
-        const bool    is_new = trackSn(*g, sn);
+        // Accounting covers the bound connection only: packets for another socket on the
+        // same group (stragglers of the previous connection, a reconnect being refused) run
+        // in their own sequence-number and timestamp space and would corrupt the window.
+        const bool    ours   = g->bound && SRTSOCKET(pkt.getHeader()[SRT_PH_ID]) == g->socket_id;
+        const bool    is_new = ours && trackSn(*g, sn);
         // A retransmission carries the original packet's timestamp, so it would measure the age
         // of the loss, not the link: under 20 % loss that inflated the spread to seconds and
         // pinned the hold at its cap. Retransmissions count as unique data but not as transit samples.
@@ -672,7 +676,13 @@ void srt::SrtlaRec::bindGroup(const sockaddr_any& peer, CUDT* u)
         return;
     }
 
-    Group* g       = ref.g;
+    Group* g = ref.g;
+    // A new connection on a surviving group (the sender's SRT reconnected while its links
+    // stayed registered) starts a new sequence-number and timestamp space. Accounting kept
+    // from the previous one would class its packets as old: per-link bitrate stuck at 0,
+    // transit and jitter frozen or offset by the restarted sender clock.
+    if (g->socket_id != u->socketID())
+        resetAccounting(*g);
     g->socket_id   = u->socketID();
     g->bound       = true;
     if (!g->has_last_addr)
@@ -683,6 +693,35 @@ void srt::SrtlaRec::bindGroup(const sockaddr_any& peer, CUDT* u)
     m_EgressMap[peer] = g;
 
     HLOGC(cnlog.Debug, log << "SRTLA bindGroup: peer " << peer.str() << " -> CUDT @" << u->socketID());
+}
+
+void srt::SrtlaRec::unbindSocket(SRTSOCKET socket_id)
+{
+    ScopedLock lock(m_Lock);
+
+    for (std::list<Group>::iterator g = m_Groups.begin(); g != m_Groups.end(); ++g)
+    {
+        if (g->bound && g->socket_id == socket_id)
+        {
+            HLOGC(cnlog.Debug, log << "SRTLA unbindSocket: @" << socket_id << " gone, group released");
+            g->bound     = false;
+            g->socket_id = SRT_INVALID_SOCK;
+        }
+    }
+}
+
+void srt::SrtlaRec::resetAccounting(Group& g)
+{
+    g.sn_valid = false; // trackSn clears the window on the next packet
+    g.ts_init  = false;
+    for (std::list<Link>::iterator it = g.links.begin(); it != g.links.end(); ++it)
+    {
+        it->unique_acc        = 0.0;
+        it->transit_ewma      = 0.0;
+        it->transit_valid     = false;
+        it->jitter_ewma       = 0.0;
+        it->have_prev_transit = false;
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -774,8 +813,11 @@ void srt::SrtlaRec::doCleanup(const time_point& now)
             }
         }
 
-        // Remove empty groups past the initial grace period (GROUP_TIMEOUT 4 s).
-        if (g->links.empty() && count_milliseconds(now - g->created_at) > 4000)
+        // Remove empty groups past the initial grace period (GROUP_TIMEOUT 4 s). A group bound
+        // to a live connection stays: when every link drops at once (all modems out for a few
+        // seconds) the sender re-registers with REG2 and the same group id, and must find the
+        // group again rather than get REG_NGP while its SRT connection is still up.
+        if (g->links.empty() && !g->bound && count_milliseconds(now - g->created_at) > 4000)
         {
             HLOGC(cnlog.Debug, log << "SRTLA group timeout (empty)");
             std::list<Group>::iterator dead = g++;
