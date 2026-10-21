@@ -44,10 +44,14 @@ jobs:
       - name: Resolve base (always the main branch unless overridden)
         id: base
         working-directory: srt
+        env:
+          BASE_REF: ${{ inputs.base }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          ref="${{ inputs.base }}"
-          [ -n "$ref" ] || ref="origin/${{ github.event.repository.default_branch }}"
-          echo "sha=$(git rev-parse "$ref")" >> "$GITHUB_OUTPUT"
+          ref="$BASE_REF"
+          [ -n "$ref" ] || ref="origin/$DEFAULT_BRANCH"
+          base_sha="$(git rev-parse --verify --end-of-options "${ref}^{commit}")"
+          echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
           echo "head: $(git log --oneline -1 HEAD)"
           echo "base: $ref ($(git log --oneline -1 "$ref"))"
       - name: Build receivers, sender, srtla_send
@@ -55,8 +59,10 @@ jobs:
         run: ./build.sh head=HEAD base=${{ steps.base.outputs.sha }}
       - name: Run scenarios (two seeds, base and head interleaved)
         working-directory: srt/testing/srtla-e2e
+        env:
+          SCENARIOS: ${{ inputs.scenarios || 'ci' }}
         run: |
-          set="${{ inputs.scenarios || 'ci' }}"
+          set="$SCENARIOS"
           ./run_matrix.py base,head "$set" --group ${{ matrix.group }}/10 --out ci-s1 --seed 1
           ./run_matrix.py base,head "$set" --group ${{ matrix.group }}/10 --out ci-s2 --seed 2
       - uses: actions/upload-artifact@v4
