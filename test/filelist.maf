@@ -30,6 +30,7 @@ test_utilities.cpp
 test_reuseaddr.cpp
 test_socketdata.cpp
 test_snd_rate_estimator.cpp
+test_srtla_rec.cpp
 
 # Tests for bonding only - put here!
 

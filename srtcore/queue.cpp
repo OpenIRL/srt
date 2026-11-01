@@ -1875,6 +1875,9 @@ void srt::CRcvQueue::removeFromLists(CUDT* u)
 {
     // the socket must be removed from Hash table first, then RcvUList
     m_pHash->remove(u->m_SocketID);
+    // SRTLA: a group bound to this connection was kept while it lived; let it go.
+    if (m_pSrtlaRec)
+        m_pSrtlaRec->unbindSocket(u->m_SocketID);
     m_pRcvUList->remove(u);
     u->m_pRNode->m_bOnList = false;
 }
