@@ -12,6 +12,7 @@
 using namespace std;
 using namespace srt;
 
+#define TEST_UDP_PORT 9990
 
 TEST(CEPoll, InfiniteWait)
 {
@@ -571,7 +572,7 @@ protected:
         sockaddr_in sa;
         memset(&sa, 0, sizeof sa);
         sa.sin_family = AF_INET;
-        sa.sin_port = htons(9999);
+        sa.sin_port = htons(TEST_UDP_PORT);
 
         ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
 
@@ -591,7 +592,7 @@ protected:
 
             ASSERT_NE(srt_epoll_wait(m_client_pollid, read, &rlen,
                         write, &wlen,
-                        -1, // -1 is set for debuging purpose.
+                        -1, // -1 is set for debugging purpose.
                         // in case of production we need to set appropriate value
                         0, 0, 0, 0), SRT_ERROR);
 
@@ -602,7 +603,7 @@ protected:
 
         char buffer[1316] = {1, 2, 3, 4};
         ASSERT_NE(srt_sendmsg(m_client_sock, buffer, sizeof buffer,
-                    -1, // infinit ttl
+                    -1, // infinite ttl
                     true // in order must be set to true
                     ),
                 SRT_ERROR);
@@ -645,7 +646,7 @@ protected:
         sockaddr_in sa;
         memset(&sa, 0, sizeof sa);
         sa.sin_family = AF_INET;
-        sa.sin_port = htons(9999);
+        sa.sin_port = htons(TEST_UDP_PORT);
         sa.sin_addr.s_addr = INADDR_ANY;
         sockaddr* psa = (sockaddr*)&sa;
 
@@ -669,7 +670,7 @@ protected:
             ASSERT_NE(srt_epoll_wait(m_server_pollid,
                         read,  &rlen,
                         write, &wlen,
-                        -1, // -1 is set for debuging purpose.
+                        -1, // -1 is set for debugging purpose.
                         // in case of production we need to set appropriate value
                         0, 0, 0, 0), SRT_ERROR );
 
@@ -696,7 +697,7 @@ protected:
             ASSERT_NE(srt_epoll_wait(m_server_pollid,
                         read,  &rlen,
                         write, &wlen,
-                        -1, // -1 is set for debuging purpose.
+                        -1, // -1 is set for debugging purpose.
                         // in case of production we need to set appropriate value
                         0, 0, 0, 0), SRT_ERROR );
 

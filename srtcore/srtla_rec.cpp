@@ -11,6 +11,8 @@
 
 #include "platform_sys.h"
 
+#include <algorithm>
+#include <vector>
 #include <random>
 
 #include "srtla_rec.h"
@@ -240,12 +242,17 @@ void srt::SrtlaRec::sendKeepalive(const sockaddr_any& dst)
 // SRT data sequence numbers (big-endian, as received).
 void srt::SrtlaRec::sendSrtlaAck(const sockaddr_any& dst, Link& l)
 {
+    if (l.ack_count <= 0)
+        return;
+
+    // Variable-length ACK: header word + one word per pending SN.
     uint8_t buf[SRTLA_ACK_LEN];
-    memset(buf, 0, sizeof buf);
     store_be32(buf, uint32_t(T_SRTLA_ACK) << 16); // 0x91000000
-    for (int i = 0; i < RECV_ACK_INT; ++i)
+    const int n = l.ack_count;
+    for (int i = 0; i < n; ++i)
         store_be32(buf + 4 + 4 * i, l.ack_log[i]);
-    m_pChannel->sendtoRaw(dst, (const char*)buf, SRTLA_ACK_LEN);
+    m_pChannel->sendtoRaw(dst, (const char*)buf, 4 + 4 * (size_t)n);
+    l.ack_count = 0;
 }
 
 // Echo a received keepalive verbatim, padded to at least MIN_PAD (spec §3.4).
@@ -521,12 +528,20 @@ srt::SrtlaRec::Ingress srt::SrtlaRec::onIngress(const sockaddr_any& src, CUnit* 
         // Count first-seen (group-wide) sequence numbers as unique. First-seen tracking,
         // not the rexmit flag: a retransmit the receiver never got is still new.
         const int32_t sn     = int32_t(w0 & 0x7FFFFFFF);
-        const bool    is_new = trackSn(*g, sn);
+        // Accounting covers the bound connection only: packets for another socket on the
+        // same group (stragglers of the previous connection, a reconnect being refused) run
+        // in their own sequence-number and timestamp space and would corrupt the window.
+        const bool    ours   = g->bound && SRTSOCKET(pkt.getHeader()[SRT_PH_ID]) == g->socket_id;
+        const bool    is_new = ours && trackSn(*g, sn);
+        // A retransmission carries the original packet's timestamp, so it would measure the age
+        // of the loss, not the link: under 20 % loss that inflated the spread to seconds and
+        // pinned the hold at its cap. Retransmissions count as unique data but not as transit samples.
+        const bool    rexmit = (pkt.getHeader()[SRT_PH_MSGNO] & MSGNO_REXMIT::mask) != 0;
         if (is_new)
-        {
             l->unique_acc += double(total); // wire bytes, same basis as recv_acc (decayed above)
-
-            // Relative one-way transit (new packets only). rel = (arrival - arrival_ref)
+        if (is_new && !rexmit)
+        {
+            // Relative one-way transit (new original packets only). rel = (arrival - arrival_ref)
             // - (sender_ts - ts_ref); the sender clock offset cancels. Sender timestamp
             // unwrapped with signed 32-bit deltas (wrap- and reorder-safe).
             const uint32_t sender_ts = pkt.getHeader()[SRT_PH_TIMESTAMP];
@@ -569,11 +584,14 @@ srt::SrtlaRec::Ingress srt::SrtlaRec::onIngress(const sockaddr_any& src, CUnit* 
             l->have_prev_transit = true;
         }
 
+        if (l->ack_count == 0)
+            l->ack_first_pending = now;
         l->ack_log[l->ack_count++] = uint32_t(sn);
-        if (l->ack_count >= RECV_ACK_INT)
+        // Flush on a full batch or when the oldest pending entry has aged out.
+        if (l->ack_count >= RECV_ACK_INT
+                || count_microseconds(now - l->ack_first_pending) >= ACK_FLUSH_US)
         {
             sendSrtlaAck(src, *l);
-            l->ack_count = 0;
         }
     }
 
@@ -592,24 +610,52 @@ bool srt::SrtlaRec::onEgress(const sockaddr_any& peer, CPacket& pkt, const socka
     if (!g)
         return false; // not an SRTLA group destination: caller sends normally
 
+    if (g->links.empty())
+    {
+        // Registration gone but the CUDT still alive: fall back to its peer address.
+        m_pChannel->sendto(peer, pkt, src);
+        return true;
+    }
+
     if (pkt.isControl())
     {
         const UDTMessageType mt = pkt.getType();
-        if (mt == UMSG_ACK || mt == UMSG_LOSSREPORT)
+
+        if (mt == UMSG_ACK)
         {
-            // Fan SRT ACK / NAK out to every link so the sender can balance and
-            // recover on all paths. sendto() round-trips byte order per call.
+            // Every link: the sender rebuilds its per-link in-flight counts from these.
             for (std::list<Link>::iterator it = g->links.begin(); it != g->links.end(); ++it)
                 m_pChannel->sendto(it->addr, pkt, src);
-            if (g->links.empty())
-                m_pChannel->sendto(peer, pkt, src);
+            return true;
+        }
+
+        if (mt == UMSG_LOSSREPORT)
+        {
+            // NAK_FANOUT links only, starting with the one that most recently delivered.
+            size_t sent = 0;
+            for (std::list<Link>::iterator it = g->links.begin(); it != g->links.end(); ++it)
+            {
+                if (g->has_last_addr && it->addr == g->last_addr)
+                {
+                    m_pChannel->sendto(it->addr, pkt, src);
+                    ++sent;
+                    break;
+                }
+            }
+            for (std::list<Link>::iterator it = g->links.begin();
+                 it != g->links.end() && sent < NAK_FANOUT; ++it)
+            {
+                if (g->has_last_addr && it->addr == g->last_addr)
+                    continue;
+                m_pChannel->sendto(it->addr, pkt, src);
+                ++sent;
+            }
             return true;
         }
     }
 
-    // Everything else goes to the group's most recently active link.
-    const sockaddr_any& dst = g->has_last_addr ? g->last_addr : peer;
-    m_pChannel->sendto(dst, pkt, src);
+    // Everything else goes over the most recently active link.
+    m_pChannel->sendto(g->has_last_addr ? g->last_addr : peer, pkt, src);
     return true;
 }
 
@@ -630,7 +676,13 @@ void srt::SrtlaRec::bindGroup(const sockaddr_any& peer, CUDT* u)
         return;
     }
 
-    Group* g       = ref.g;
+    Group* g = ref.g;
+    // A new connection on a surviving group (the sender's SRT reconnected while its links
+    // stayed registered) starts a new sequence-number and timestamp space. Accounting kept
+    // from the previous one would class its packets as old: per-link bitrate stuck at 0,
+    // transit and jitter frozen or offset by the restarted sender clock.
+    if (g->socket_id != u->socketID())
+        resetAccounting(*g);
     g->socket_id   = u->socketID();
     g->bound       = true;
     if (!g->has_last_addr)
@@ -643,6 +695,38 @@ void srt::SrtlaRec::bindGroup(const sockaddr_any& peer, CUDT* u)
     HLOGC(cnlog.Debug, log << "SRTLA bindGroup: peer " << peer.str() << " -> CUDT @" << u->socketID());
 }
 
+void srt::SrtlaRec::unbindSocket(SRTSOCKET socket_id)
+{
+    ScopedLock lock(m_Lock);
+
+    for (std::list<Group>::iterator g = m_Groups.begin(); g != m_Groups.end(); ++g)
+    {
+        if (g->bound && g->socket_id == socket_id)
+        {
+            HLOGC(cnlog.Debug, log << "SRTLA unbindSocket: @" << socket_id << " gone, group released");
+            g->bound     = false;
+            g->socket_id = SRT_INVALID_SOCK;
+        }
+    }
+}
+
+void srt::SrtlaRec::resetAccounting(Group& g)
+{
+    g.sn_valid      = false; // trackSn clears the window on the next packet
+    g.sn_max        = 0;
+    g.ts_init       = false;
+    g.ts_last_raw   = 0;
+    g.sender_ts_acc = 0;
+    for (std::list<Link>::iterator it = g.links.begin(); it != g.links.end(); ++it)
+    {
+        it->unique_acc        = 0.0;
+        it->transit_ewma      = 0.0;
+        it->transit_valid     = false;
+        it->jitter_ewma       = 0.0;
+        it->have_prev_transit = false;
+    }
+}
+
 // --------------------------------------------------------------------------
 // Periodic: timeouts, recovery keepalives, per-second stats (spec §6, §3.6)
 // --------------------------------------------------------------------------
@@ -653,9 +737,26 @@ void srt::SrtlaRec::onPeriodic(const time_point& now)
 
     if (!m_HaveTimers)
     {
-        m_LastCleanup = now;
-        m_HaveTimers  = true;
+        m_LastCleanup  = now;
+        m_LastLinkPass = now;
+        m_HaveTimers   = true;
         return;
+    }
+
+    // Flush aged partial SRTLA-ACK batches (covers links that went quiet). Throttled:
+    // the pass is O(groups x links) and the receive worker reaches it once per datagram.
+    if (count_microseconds(now - m_LastLinkPass) >= LINK_PASS_US)
+    {
+        m_LastLinkPass = now;
+
+        for (std::list<Group>::iterator g = m_Groups.begin(); g != m_Groups.end(); ++g)
+        {
+            for (std::list<Link>::iterator it = g->links.begin(); it != g->links.end(); ++it)
+            {
+                if (it->ack_count > 0 && count_microseconds(now - it->ack_first_pending) >= ACK_FLUSH_US)
+                    sendSrtlaAck(it->addr, *it);
+            }
+        }
     }
 
     if (count_milliseconds(now - m_LastCleanup) >= 3000) // CLEANUP_PERIOD
@@ -715,8 +816,11 @@ void srt::SrtlaRec::doCleanup(const time_point& now)
             }
         }
 
-        // Remove empty groups past the initial grace period (GROUP_TIMEOUT 4 s).
-        if (g->links.empty() && count_milliseconds(now - g->created_at) > 4000)
+        // Remove empty groups past the initial grace period (GROUP_TIMEOUT 4 s). A group bound
+        // to a live connection stays: when every link drops at once (all modems out for a few
+        // seconds) the sender re-registers with REG2 and the same group id, and must find the
+        // group again rather than get REG_NGP while its SRT connection is still up.
+        if (g->links.empty() && !g->bound && count_milliseconds(now - g->created_at) > 4000)
         {
             HLOGC(cnlog.Debug, log << "SRTLA group timeout (empty)");
             std::list<Group>::iterator dead = g++;
@@ -727,6 +831,52 @@ void srt::SrtlaRec::doCleanup(const time_point& now)
             ++g;
         }
     }
+}
+
+uint32_t srt::SrtlaRec::holdSteadyUs(SRTSOCKET socket_id)
+{
+    ScopedLock lock(m_Lock);
+
+    Group* grp = NULL;
+    for (std::list<Group>::iterator g = m_Groups.begin(); g != m_Groups.end(); ++g)
+    {
+        if (g->bound && g->socket_id == socket_id)
+        {
+            grp = &*g;
+            break;
+        }
+    }
+    if (!grp)
+        return 0;
+
+    const time_point now = steady_clock::now();
+
+    std::vector<double> transit, jitter;
+    for (std::list<Link>::iterator it = grp->links.begin(); it != grp->links.end(); ++it)
+    {
+        // transit_ewma only advances on arriving data, so a stale one is not a current
+        // measurement and must not widen the spread.
+        if (!it->transit_valid || count_microseconds(now - it->last_transit) > LINK_FRESH_US)
+            continue;
+        transit.push_back(it->transit_ewma);
+        jitter.push_back(it->jitter_ewma);
+    }
+    if (transit.empty())
+        return 0;
+    // The slowest link the hold waits for: a link that is late by more than the cap is not
+    // covered and gets starved by the sender's own loss penalties, links inside it stay in the
+    // bond. (A median-of-links policy was measured end to end and rejected.)
+    const double tmin = *std::min_element(transit.begin(), transit.end());
+    const double tmax = *std::max_element(transit.begin(), transit.end());
+    const double jmax = *std::max_element(jitter.begin(), jitter.end());
+    double hold = (tmax - tmin) + 4.0 * jmax;
+    HLOGC(qrlog.Debug, log << "SRTLA hold: " << transit.size() << " fresh links, spread " << ((tmax - tmin) / 1000.0)
+            << " ms, jitter " << (jmax / 1000.0) << " ms -> steady " << (hold / 1000.0) << " ms");
+    if (hold < 0.0)
+        hold = 0.0;
+    if (hold > 10e6)
+        hold = 10e6;
+    return (uint32_t)hold;
 }
 
 // Fill @a out with the group's live per-link EWMA values (read fresh); rates get a
@@ -753,6 +903,8 @@ bool srt::SrtlaRec::fillStats(SRTSOCKET socket_id, SRT_SRTLA_STATS* out)
     const time_point now = steady_clock::now();
     out->valid = 1;
     out->nowMs = uint64_t(count_milliseconds(now.time_since_epoch()));
+    out->timestamp = out->nowMs;
+    out->totalBitrate = 0;
 
     int i = 0;
     for (std::list<Link>::iterator it = grp->links.begin();
@@ -770,6 +922,14 @@ bool srt::SrtlaRec::fillStats(SRTSOCKET socket_id, SRT_SRTLA_STATS* out)
         out->peers[i].transitUs      = int32_t(it->transit_ewma);
         out->peers[i].usJitter       = uint32_t(it->jitter_ewma);
         out->peers[i].establishedMs  = uint64_t(count_milliseconds(it->established.time_since_epoch()));
+
+        out->peers[i].bitrate = out->peers[i].kbpsRecvUnique;
+        out->peers[i].throughput = out->peers[i].kbpsRecvRate;
+        out->peers[i].jitter = out->peers[i].usJitter;
+        out->peers[i].bytesReceived = 0;
+        const uint64_t uptime_ms = out->nowMs > out->peers[i].establishedMs ? out->nowMs - out->peers[i].establishedMs : 0;
+        out->peers[i].uptime = uint32_t((uptime_ms / 1000) > 0xffffffffu ? 0xffffffffu : (uptime_ms / 1000));
+        out->totalBitrate += out->peers[i].bitrate;
     }
     out->numPeers = uint8_t(i);
     return true;

@@ -17,6 +17,50 @@ Additional information on building for Windows is available in the
 document and in the [SRT CookBook](https://srtlab.github.io/srt-cookbook/getting-started/build-on-windows/).
 
 
+## Building as a subproject
+
+The CMake tool offers the ability to add a complete project as a subdirectory.
+If you do this with SRT, note that all variables that can be optionally set
+will get values from the parent configuration file including the one from SRT.
+
+To allow isolation of these variables and setting them explicitly to desired
+values in case when the parent project uses variables with the same names,
+there's a special feature provided: set the desired variables for the SRT
+project using `LIBSRT_` prefix - this way they will get the values to the
+right variables, visible only in the scope of the SRT build configuration.
+
+NOTE: This feature needs to be generally enabled by:
+
+```
+set (LIBSRT_ENABLE_IMPORT_VARIABLES 1)
+```
+
+otherwise all other variables with `LIBSRT_` prefix will be ignored.
+
+This will not prevent the variables from being seen as derived in SRT project
+scope, but if you explicitly set a variable this way, it will be set to the
+desired value inside the SRT project. It will not set the same variable in the
+parent project, and it will also override (locally in SRT project only) any
+value of a variable with the same name in the parent project.
+
+For example, if you want to set `ENABLE_SHARED=OFF` in the parent project,
+add this before importing the SRT project:
+
+```
+set (LIBSRT_ENABLE_IMPORT_VARIABLES 1)
+set (LIBSRT_ENABLE_SHARED OFF)
+```
+
+If you already have a variable named `ENABLE_SHARED` in your project (existing
+before the call to `add_subdirectory` with SRT), its value will be derived in
+the SRT project, unless you override it by setting `LIBSRT_ENABLE_SHARED` to a
+different value.
+
+Note that the trick works simply by getting the actual variable name through
+cutting off the `LIBSRT_` prefix; the check whether this variable is of any use
+will be done after that.
+
+
 ## List of Build Options
 
 The following table lists available build options in alphabetical order.
@@ -64,7 +108,7 @@ Option details are given further below.
 | [`USE_ENCLIB`](#use_enclib)                                  | 1.3.3 | `STRING`  | openssl    | Encryption library to be used (`openssl`, `openssl-evp` (since 1.5.1), `gnutls`, `mbedtls`, `botan` (since 1.6.0)).                                                         |
 | [`USE_GNUSTL`](#use_gnustl)                                  | 1.3.4 | `BOOL`    | OFF        | Use `pkg-config` with the `gnustl` package name to extract the header and library path for the C++ standard library.                                 |
 | [`USE_OPENSSL_PC`](#use_openssl_pc)                          | 1.3.0 | `BOOL`    | ON         | Use `pkg-config` to find OpenSSL libraries.                                                                                                          |
-| [`OPENSSL_USE_STATIC_LIBS`](#openssl_use_static_libs)        | 1.5.0 | `BOOL`    | OFF        | Link OpenSSL statically.                                                                                                                             |
+| [`SRT_USE_OPENSSL_STATIC_LIBS`](#srt_use_openssl_static_libs)| 1.5.0 | `BOOL`    | OFF        | Link OpenSSL statically.                                                                                                                             |
 | [`USE_STATIC_LIBSTDCXX`](#use_static_libstdcxx)              | 1.2.0 | `BOOL`    | OFF        | Enforces linking the SRT library against the static `libstdc++` library.                                                                             |
 | [`WITH_COMPILER_PREFIX`](#with_compiler_prefix)              | 1.3.0 | `STRING`  | OFF        | Sets C/C++ toolchains as `<prefix><c-compiler>` and `<prefix><c++-compiler>`, overriding the default compiler.                                       |
 | [`WITH_COMPILER_TYPE`](#with_compiler_type)                  | 1.3.0 | `STRING`  | OFF        | Sets the compiler type to be used (values: gcc, cc, clang, etc.).                                                                                    |
@@ -618,8 +662,8 @@ built-in one).
 When ON, uses `pkg-config` to find OpenSSL libraries. You can turn this OFF to
 force `cmake` to find OpenSSL by its own preferred method.
 
-### OPENSSL_USE_STATIC_LIBS
-**`--openssl-use-static-libs`** (default: OFF)
+### SRT_USE_OPENSSL_STATIC_LIBS
+**`--srt-use-openssl-static-libs`** (default: OFF)
 
 When ON, OpenSSL libraries are linked statically.
 When `pkg-config`(`-DUSE_OPENSSL_PC=ON`) is used, static OpenSSL libraries are listed in `SSL_STATIC_LIBRARIES`. See `<prefix>_STATIC` in [CMake's FindPkgConfig](https://cmake.org/cmake/help/latest/module/FindPkgConfig.html).

@@ -176,6 +176,7 @@ struct Receiver
     Metric<BytesPackets> recvdUnique;
     Metric<BytesPackets> recvdRetrans; // The number of retransmitted data packets received by the receiver.
     Metric<BytesPackets> lost; // The number of packets detected by the receiver as lost.
+    Metric<Packets> lostConfirmed; // The number of packets the receiver requested back, i.e. still missing once the reorder grace period was over. Counts a sequence once; NAK repeats are not counted.
     Metric<BytesPackets> dropped; // The number of packets dropped by the receiver (as too-late to be delivered).
     Metric<BytesPackets> recvdBelated; // The number of belated packets received (dropped as too late but eventually received).
     Metric<BytesPackets> undecrypted; // The number of packets received by the receiver that failed to be decrypted.
@@ -193,6 +194,7 @@ struct Receiver
         recvdUnique.reset();
         recvdRetrans.reset();
         lost.reset();
+        lostConfirmed.reset();
         dropped.reset();
         recvdBelated.reset();
         undecrypted.reset();
@@ -209,6 +211,7 @@ struct Receiver
         recvdUnique.resetTrace();
         recvdRetrans.resetTrace();
         lost.resetTrace();
+        lostConfirmed.resetTrace();
         dropped.resetTrace();
         recvdBelated.resetTrace();
         undecrypted.resetTrace();

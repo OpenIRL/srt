@@ -303,9 +303,11 @@ public:
 class UdpCommon
 {
 protected:
-    int m_sock = -1;
-    srt::sockaddr_any sadr;
+    SYSSOCKET m_sock = -1;
     std::string adapter;
+    srt::sockaddr_any interface_addr;
+    srt::sockaddr_any target_addr;
+    bool is_multicast = false;
     std::map<std::string, std::string> m_options;
     void Setup(std::string host, int port, std::map<std::string,std::string> attr);
     void Error(int err, std::string src);
@@ -323,7 +325,7 @@ public:
 
     MediaPacket Read(size_t chunk) override;
 
-    bool IsOpen() override { return m_sock != -1; }
+    bool IsOpen() override { return m_sock != SYSSOCKET_INVALID; }
     bool End() override { return eof; }
 };
 
@@ -333,7 +335,7 @@ public:
     UdpTarget(std::string host, int port, const std::map<std::string,std::string>& attr);
 
     void Write(const MediaPacket& data) override;
-    bool IsOpen() override { return m_sock != -1; }
+    bool IsOpen() override { return m_sock != SYSSOCKET_INVALID; }
     bool Broken() override { return false; }
 };
 
@@ -346,7 +348,7 @@ public:
     {
     }
 
-    bool IsOpen() override { return m_sock != -1; }
+    bool IsOpen() override { return m_sock != SYSSOCKET_INVALID; }
 };
 
 

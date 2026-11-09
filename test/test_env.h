@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include "gtest/gtest.h"
 
+#include "sync.h"
 
 namespace srt
 {
@@ -40,6 +41,22 @@ public:
     // All must be static, return bool. Arguments allowed.
     // The name must start with Allowed_.
     static bool Allowed_IPv6();
+
+    template<typename... Args>
+    static bool Allowed_Platform(const std::string& first, const Args&... follow)
+    {
+        if (first == SRT_TEST_SYSTEM_NAME)
+            return true;
+        return Allowed_Platform(follow...);
+    }
+
+    static bool Allowed_Platform() { return false; }
+
+#ifdef ENABLE_BONDING
+    static bool Allowed_Bonding() { return true; }
+#else
+    static bool Allowed_Bonding() { return false; }
+#endif
 };
 
 #define SRTST_REQUIRES(feature,...) if (!srt::TestEnv::Allowed_##feature(__VA_ARGS__)) { return; }
@@ -129,8 +146,36 @@ public:
     }
 };
 
+class CUDT;
+class CPacket;
+struct CUnit;
+class CUDTSocket;
+
+class TestMockCUDT
+{
+public:
+    CUDT* core;
+
+    TestMockCUDT() : core(NULL) {}
+
+    bool setSocket(int32_t socket);
+
+    // This is used in TestFEC; leaving with a single forwarder 
+    // to keep the test as is. The class can be as well extended.
+    bool checkApplyFilterConfig(const std::string& s);
+
+    bool processSrtMsg(const srt::CPacket *ctrlpkt);
+    int rcvKmState();
+    int processData(CUnit* u);
+    CUDTSocket* locateSocket(int32_t s);
+
+    void processCtrlAck(const CPacket& pkt, const sync::steady_clock::time_point& t);
+    int flowWindowSize() const;
+    void setFlowWindowSize(int v);
+};
+
 struct sockaddr_any CreateAddr(const std::string& name, unsigned short port, int pref_family);
 
-} //namespace
+} //namespace srt
 
 #endif

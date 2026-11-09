@@ -2,23 +2,23 @@ name: Android
 
 on:
   push:
-    branches: [ master ]
+    branches: [ "master", "dev" ]
   pull_request:
-    branches: [ master ]
+    branches: [ "master", "dev" ]
 
 jobs:
   build:
     name: NDK-R23
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
 
     steps:
     - name: Setup Android NDK R23
-      uses: nttld/setup-ndk@v1
+      uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1.6.0
       id: setup-ndk
       with:
         ndk-version: r23
         add-to-path: false
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: build
       run: |
         cd ./scripts/build-android/

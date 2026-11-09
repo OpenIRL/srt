@@ -109,17 +109,21 @@ written by
 
 #define SRT_ATR_DEPRECATED
 #define SRT_ATR_DEPRECATED_PX [[deprecated]]
+#define SRT_ATR_NODISCARD [[nodiscard]]
 
 // GNUG is GNU C/C++; this syntax is also supported by Clang
 #elif defined(__GNUC__)
 #define SRT_ATR_DEPRECATED_PX
 #define SRT_ATR_DEPRECATED __attribute__((deprecated))
+#define SRT_ATR_NODISCARD __attribute__((warn_unused_result))
 #elif defined(_MSC_VER)
 #define SRT_ATR_DEPRECATED_PX __declspec(deprecated)
 #define SRT_ATR_DEPRECATED // no postfix-type modifier
+#define SRT_ATR_NODISCARD _Check_return_
 #else
 #define SRT_ATR_DEPRECATED_PX
 #define SRT_ATR_DEPRECATED
+#define SRT_ATR_NODISCARD
 #endif
 
 #ifdef __cplusplus
@@ -138,8 +142,10 @@ static const int32_t SRTGROUP_MASK = (1 << 30);
 
 #ifdef _WIN32
    typedef SOCKET SYSSOCKET;
+   static const SYSSOCKET SYSSOCKET_INVALID = INVALID_SOCKET;
 #else
    typedef int SYSSOCKET;
+   static const int SYSSOCKET_INVALID = -1;
 #endif
 
 #ifndef ENABLE_BONDING
@@ -182,7 +188,7 @@ typedef enum SRT_SOCKOPT {
    SRTO_RCVTIMEO = 14,       // recv() timeout
    SRTO_REUSEADDR = 15,      // reuse an existing port or create a new one
    SRTO_MAXBW = 16,          // maximum bandwidth (bytes per second) that the connection can use
-   SRTO_STATE = 17,          // current socket state, see UDTSTATUS, read only
+   SRTO_STATE = 17,          // current socket state, see SRT_SOCKSTATUS, read only
    SRTO_EVENT = 18,          // current available events associated with the socket
    SRTO_SNDDATA = 19,        // size of data in the sending buffer
    SRTO_RCVDATA = 20,        // size of data available for recv
@@ -217,7 +223,7 @@ typedef enum SRT_SOCKOPT {
    SRTO_PAYLOADSIZE,         // Maximum payload size sent in one UDP packet (0 if unlimited)
    SRTO_TRANSTYPE = 50,      // Transmission type (set of options required for given transmission type)
    SRTO_KMREFRESHRATE,       // After sending how many packets the encryption key should be flipped to the new key
-   SRTO_KMPREANNOUNCE,       // How many packets before key flip the new key is annnounced and after key flip the old one decommissioned
+   SRTO_KMPREANNOUNCE,       // How many packets before key flip the new key is announced and after key flip the old one decommissioned
    SRTO_ENFORCEDENCRYPTION,  // Connection to be rejected or quickly broken when one side encryption set or bad password
    SRTO_IPV6ONLY,            // IPV6_V6ONLY mode
    SRTO_PEERIDLETIMEO,       // Peer-idle timeout (max time of silence heard from peer) in [ms]
@@ -236,11 +242,17 @@ typedef enum SRT_SOCKOPT {
 
    SRTO_SRTLA = 120, // On a listener: designate an SRTLA (link-aggregation) demux listener.
                      // Inherited by accepted connections, where it also enables the SRTLA
-                     // multipath delivery tuning (retransmit-flag / ordered-delivery heuristics).
-                     // (Formerly SRTO_SRTLAPATCHES.)
+                     // multipath delivery tuning (retransmit-flag / ordered-delivery heuristics)
+                     // and enforces the SRTLA minimum receiver latency of 1000 ms: a lower
+                     // SRTO_RCVLATENCY / SRTO_LATENCY is raised on accept and the raised value
+                     // is negotiated to the sender. (Formerly SRTO_SRTLAPATCHES.)
 
    SRTO_E_SIZE // Always last element, not a valid option.
 } SRT_SOCKOPT;
+
+#ifndef SRTO_SRTLAPATCHES
+#define SRTO_SRTLAPATCHES SRTO_SRTLA
+#endif
 
 
 #ifdef __cplusplus
@@ -406,6 +418,21 @@ struct CBytePerfMon
    int64_t  pktRecvUnique;              // number of packets to be received by the application
    uint64_t byteSentUnique;             // number of data bytes, sent by the application
    uint64_t byteRecvUnique;             // number of data bytes to be received by the application
+
+   // Packets that were still missing once the reorder grace period was over and were
+   // therefore requested back. Unlike pktRcvLoss (a sequence discontinuity metric per
+   // RFC 4737, which counts reordering as loss and never takes it back), this counts
+   // only losses the receiver itself concluded were real. NAK repeats are not counted.
+   int      pktRcvLossConfirmedTotal;   // total number of packets confirmed as lost (receiver side)
+   int      pktRcvLossConfirmed;        // number of packets confirmed as lost (receiver side)
+
+   // Share of the traffic that was not impaired, in percent (100 = clean, 0 = nothing
+   // got through), over the last completed one-second sampling window. The window is
+   // rolled internally on its own cadence, so these are independent of @a clear and of
+   // how often the caller polls: every read inside the same window returns the same
+   // value. Both are 100 for an idle window.
+   double   pctSndQuality;              // 100 * pktSentUnique / (pktSentUnique + pktRetrans + pktSndDrop)
+   double   pctRcvQuality;              // 100 * pktRecvUnique / (pktRecvUnique + pktRcvLossConfirmed)
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -600,7 +627,7 @@ enum SRT_REJECT_REASON
 #define SRT_LOGFA_CONGEST    7   // cclog: Congestion control module
 #define SRT_LOGFA_PFILTER    8   // pflog: Packet filter module
 
-#define SRT_LOGFA_API_CTRL   11  // aclog: API part for socket and library managmenet
+#define SRT_LOGFA_API_CTRL   11  // aclog: API part for socket and library management
 
 #define SRT_LOGFA_QUE_CTRL   13  // qclog: Queue control activities
 
@@ -640,10 +667,9 @@ enum SRT_KM_STATE
     SRT_KM_S_SECURING      = 1, // Stream encrypted, exchanging Keying Material
     SRT_KM_S_SECURED       = 2, // Stream encrypted, keying Material exchanged, decrypting ok.
     SRT_KM_S_NOSECRET      = 3, // Stream encrypted and no secret to decrypt Keying Material
-    SRT_KM_S_BADSECRET     = 4 // Stream encrypted and wrong secret is used, cannot decrypt Keying Material
-#ifdef ENABLE_AEAD_API_PREVIEW
-    ,SRT_KM_S_BADCRYPTOMODE = 5  // Stream encrypted but wrong cryptographic mode is used, cannot decrypt. Since v1.5.2.
-#endif
+    SRT_KM_S_BADSECRET     = 4, // Stream encrypted and wrong secret is used, cannot decrypt Keying Material
+    SRT_KM_S_BADCRYPTOMODE = 5,  // Stream encrypted but wrong cryptographic mode is used, cannot decrypt. Since v1.5.2.
+    SRT_KM_S_E_SIZE
 };
 
 enum SRT_EPOLL_OPT
@@ -1006,6 +1032,13 @@ typedef struct SRT_SRTLA_PEER_STATS_ {
     int32_t  transitUs;         // smoothed relative one-way transit (consumer anchors RTT to msRTT)
     uint32_t usJitter;          // smoothed jitter, microseconds (RFC 3550)
     uint64_t establishedMs;     // link start, demux monotonic milliseconds
+
+    // Legacy OpenIRL source compatibility for srt-live-server 1.5.2.
+    uint32_t bitrate;
+    uint32_t jitter;
+    uint64_t bytesReceived;
+    uint32_t uptime;
+    uint32_t throughput;
 } SRT_SRTLA_PEER_STATS;
 
 typedef struct SRT_SRTLA_STATS_ {
@@ -1014,6 +1047,10 @@ typedef struct SRT_SRTLA_STATS_ {
     uint8_t  numPeers;
     uint64_t nowMs;             // demux monotonic "now" (derive uptime = nowMs - establishedMs)
     SRT_SRTLA_PEER_STATS peers[SRT_SRTLA_MAX_PEERS];
+
+    // Legacy OpenIRL source compatibility for srt-live-server 1.5.2.
+    uint32_t totalBitrate;
+    uint64_t timestamp;
 } SRT_SRTLA_STATS;
 
 SRT_API int srt_srtla_stats(SRTSOCKET u, SRT_SRTLA_STATS* stats);

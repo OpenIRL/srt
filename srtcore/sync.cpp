@@ -347,7 +347,7 @@ int srt::sync::genRandomInt(int minVal, int maxVal)
 #endif
 
     // Map onto [minVal, maxVal].
-    // Note. There is a minuscule probablity to get maxVal+1 as the result.
+    // Note. There is a minuscule probability to get maxVal+1 as the result.
     // So we have to use long long to handle cases when maxVal = INT32_MAX.
     // Also we must check 'res' does not exceed maxVal,
     // which may happen if rand_0_1 = 1, even though the chances are low.
@@ -357,6 +357,11 @@ int srt::sync::genRandomInt(int minVal, int maxVal)
 #endif // HAVE_CXX11
 }
 
+#if defined(ENABLE_STDCXX_SYNC) && HAVE_CXX17
+
+// Shared mutex imp not required - aliased from C++17
+
+#else
 
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -452,3 +457,5 @@ int srt::sync::SharedMutex::getReaderCount() const
     ScopedLock lk(m_Mutex);
     return m_iCountRead;
 }
+#endif // C++17 for shared_mutex
+

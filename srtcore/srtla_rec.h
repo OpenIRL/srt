@@ -60,9 +60,14 @@ public:
     static const size_t   SRTLA_ACK_LEN        = 44; // header word + 10 SNs
     static const size_t   SRT_MIN_LEN          = 16; // min length treated as an SRT packet
     static const size_t   MIN_PAD              = 32; // short control packets padded to this
-    static const int      RECV_ACK_INT         = 10; // SRT data packets per SRTLA ACK
+    static const int      RECV_ACK_INT         = 10; // SRT data packets per SRTLA ACK (batch cap)
+    static const int64_t  ACK_FLUSH_US         = 10000; // partial-batch flush age
     static const size_t   MAX_CONNS_PER_GROUP  = 16; // == SRT_SRTLA_MAX_PEERS
     static const size_t   MAX_GROUPS           = 200;
+
+    static const size_t   NAK_FANOUT           = 2;       // links a loss report is duplicated over
+    static const int64_t  LINK_FRESH_US        = 1000000; // age up to which a transit measurement counts
+    static const int64_t  LINK_PASS_US         = 2000;    // period of the per-link pass in onPeriodic()
     static const int32_t  SN_WINDOW_SIZE       = 65536; // retransmission-tracking bitmap
     static const int32_t  SN_WINDOW_MASK       = SN_WINDOW_SIZE - 1;
 
@@ -103,6 +108,10 @@ public:
     /// reverse path can find the group.
     void bindGroup(const sockaddr_any& peer, CUDT* u);
 
+    /// The connection @a socket_id has left the receive queue (closed or broken): release
+    /// its group, which from then on times out like any other once its links are gone.
+    void unbindSocket(SRTSOCKET socket_id);
+
     /// Periodic pass (receive worker timing section): link/group timeouts and recovery
     /// keepalives. Internally throttled.
     void onPeriodic(const sync::steady_clock::time_point& now);
@@ -111,6 +120,10 @@ public:
     /// maintained EWMAs, read fresh) of the SRTLA group bound to @a socket_id.
     /// Returns true (out.valid = 1) if such a group exists.
     bool fillStats(SRTSOCKET socket_id, SRT_SRTLA_STATS* out);
+
+    /// Link-timing summary for the group bound to @a socket_id, in
+    /// microseconds. Returns 0 while no valid measurement exists.
+    uint32_t holdSteadyUs(SRTSOCKET socket_id);
 
 private:
     typedef sync::steady_clock::time_point time_point;
@@ -125,8 +138,9 @@ private:
         bool         recovering;
 
         // SRTLA-ACK batch: raw 31-bit SNs in receive order (spec §3.5).
-        uint32_t ack_log[RECV_ACK_INT];
-        int      ack_count;
+        uint32_t   ack_log[RECV_ACK_INT];
+        int        ack_count;
+        time_point ack_first_pending; // when the oldest unsent entry was queued
 
         uint32_t connectionId;         // FNV-1a of addr+port
 
@@ -166,7 +180,7 @@ private:
         SRTSOCKET       socket_id; // bound CUDT socket id, or SRT_INVALID_SOCK
         bool            bound;
         time_point      created_at;
-        sockaddr_any    last_addr;   // most recently active link (reverse path primary)
+        sockaddr_any    last_addr;   // most recently active link (reverse path, REG1 idempotency)
         bool            has_last_addr;
         bool            data_seen;
 
@@ -248,6 +262,7 @@ private:
 
     // --- accounting helpers ---
     bool trackSn(Group& g, int32_t sn);            // returns true if unique (first seen)
+    void resetAccounting(Group& g);                // new connection bound: forget the old one's
 
     // --- cleanup ---
     void doCleanup(const time_point& now);
@@ -268,10 +283,13 @@ private:
     std::map<sockaddr_any, Group*, AddrLess>  m_EgressMap; // CUDT peer addr → group (bind lifetime)
 
     time_point m_LastCleanup;
+    time_point m_LastLinkPass;
     bool       m_HaveTimers;
 
     SrtlaRec(const SrtlaRec&);
     SrtlaRec& operator=(const SrtlaRec&);
+
+    friend class SrtlaRecTestAccess; // unit tests
 };
 
 } // namespace srt

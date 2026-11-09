@@ -52,6 +52,8 @@ modified by
 
 #include "platform_sys.h"
 
+#include <algorithm>
+
 #include "list.h"
 #include "packet.h"
 #include "logging.h"
@@ -740,7 +742,7 @@ int32_t srt::CRcvLossList::removeUpTo(int32_t seqno_last)
 
     if (CSeqNo::seqcmp(seqno_last, first) < 0)
     {
-        //HLOGC(tslog.Debug, log << "rcv-loss: DROP to %" << seqno_last << " - first %" << first << " is newer, exitting");
+        //HLOGC(tslog.Debug, log << "rcv-loss: DROP to %" << seqno_last << " - first %" << first << " is newer, exiting");
         return first; // seqno_last older than first - nothing to remove
     }
 
@@ -791,13 +793,12 @@ int32_t srt::CRcvLossList::getFirstLostSeq() const
     return m_caSeq[m_iHead].seqstart;
 }
 
-void srt::CRcvLossList::getLossArray(int32_t* array, int& len, int limit)
+int srt::CRcvLossList::getLossArray(FixedArray<int32_t>& array)
 {
-    len = 0;
-
+    int len = 0;
     int i = m_iHead;
 
-    while ((len < limit - 1) && (-1 != i))
+    while ((len < int(array.size()) - 1) && (i != -1))
     {
         array[len] = m_caSeq[i].seqstart;
         if (SRT_SEQNO_NONE != m_caSeq[i].seqend)
@@ -812,11 +813,13 @@ void srt::CRcvLossList::getLossArray(int32_t* array, int& len, int limit)
 
         i = m_caSeq[i].inext;
     }
+    return len;
 }
 
 srt::CRcvFreshLoss::CRcvFreshLoss(int32_t seqlo, int32_t seqhi, int initial_age)
     : ttl(initial_age)
     , timestamp(steady_clock::now())
+    , report_time() // zero: never reported yet
 {
     seq[0] = seqlo;
     seq[1] = seqhi;
@@ -897,7 +900,8 @@ srt::CRcvFreshLoss::Emod srt::CRcvFreshLoss::revoke(int32_t lo, int32_t hi)
     return DELETE;
 }
 
-bool srt::CRcvFreshLoss::removeOne(std::deque<CRcvFreshLoss>& w_container, int32_t sequence, int* pw_had_ttl)
+bool srt::CRcvFreshLoss::removeOne(std::deque<CRcvFreshLoss>& w_container, int32_t sequence, int* pw_had_ttl,
+                                   srt::sync::steady_clock::time_point* pw_detect_time)
 {
     for (size_t i = 0; i < w_container.size(); ++i)
     {
@@ -906,6 +910,10 @@ bool srt::CRcvFreshLoss::removeOne(std::deque<CRcvFreshLoss>& w_container, int32
 
         if (wh == NONE)
             continue;  // Not found. Search again.
+
+        // Read before a possible erase below; revoke() never touches the timestamp.
+        if (pw_detect_time)
+            *pw_detect_time = w_container[i].timestamp;
 
         if (wh == DELETE)   //  ... oo ... x ... o ... => ... oo ... o ...
         {
@@ -927,8 +935,11 @@ bool srt::CRcvFreshLoss::removeOne(std::deque<CRcvFreshLoss>& w_container, int32
 
             // Use position of the NEXT element because insertion happens BEFORE pointed element.
             // Use the same TTL (will stay the same in the other one).
-            w_container.insert(w_container.begin() + i + 1,
-                    CRcvFreshLoss(next_begin, next_end, w_container[i].ttl));
+            // Both halves keep the original time history.
+            CRcvFreshLoss upper(next_begin, next_end, w_container[i].ttl);
+            upper.timestamp   = w_container[i].timestamp;
+            upper.report_time = w_container[i].report_time;
+            w_container.insert(w_container.begin() + i + 1, upper);
         }
         // For STRIPPED:  ... xooo ... => ... ooo ...
         // i.e. there's nothing to do.
@@ -944,5 +955,99 @@ bool srt::CRcvFreshLoss::removeOne(std::deque<CRcvFreshLoss>& w_container, int32
         *pw_had_ttl = 0;
     return false;
 
+}
+
+namespace
+{
+// Whether a record belongs in this report, disregarding the payload cap.
+// @a want_first selects the pass: true = records never reported before.
+bool srtlaNakEligible(const srt::CRcvFreshLoss&                  rec,
+                      const srt::sync::steady_clock::time_point& now,
+                      const srt::SrtlaNakParams&                 params,
+                      bool                                       want_first)
+{
+    using namespace srt::sync;
+
+    const bool first_report = is_zero(rec.report_time);
+    if (first_report != want_first)
+        return false;
+
+    if (rec.ttl > 0)
+        return false; // not yet witnessed by enough subsequent packets
+
+    const int64_t age_us = count_microseconds(now - rec.timestamp);
+    if (age_us < params.hold_us)
+        return false; // still within the reordering grace period
+
+    // What is left of the play budget for one more round trip.
+    const int64_t remaining_us = params.budget_us > 0 ? params.budget_us - age_us - params.rtt_us - params.margin_us : 1;
+    if (remaining_us < 0)
+        return false; // no round trip fits any more
+
+    int64_t spacing_us = params.spacing_us;
+    // The closer the play deadline, the sooner a repeat. With plenty of budget left the normal
+    // spacing applies (few duplicates); once only a couple of round trips fit, repeat at half the
+    // remaining time so at least two more attempts can be made before the deadline.
+    if (remaining_us > 0 && remaining_us / 2 < spacing_us)
+        spacing_us = std::max<int64_t>(remaining_us / 2, 50000);
+    if (!first_report && count_microseconds(now - rec.report_time) < spacing_us)
+        return false; // repeat not due yet
+
+    return true;
+}
+} // namespace
+
+srt::SrtlaNakPlan srt::srtlaPlanNak(const std::deque<CRcvFreshLoss>&      fresh,
+                                    const srt::sync::steady_clock::time_point& now,
+                                    const SrtlaNakParams&                 params)
+{
+    using namespace srt::sync;
+
+    SrtlaNakPlan plan;
+
+    // Records are appended in detection order, and a split in removeOne() copies the
+    // original timestamp into both halves, so the container is sorted by age: everything
+    // past the play budget is a prefix.
+    if (params.budget_us > 0)
+    {
+        while (plan.retire < fresh.size()
+               && count_microseconds(now - fresh[plan.retire].timestamp) > params.budget_us)
+        {
+            ++plan.retire;
+        }
+
+    }
+
+    size_t used = 0; // 32-bit words already claimed in the report
+
+    // Two passes so a never-reported loss cannot be crowded out of a full report by
+    // repeats of older ones.
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        const bool want_first = (pass == 0);
+
+        for (size_t i = plan.retire; i < fresh.size(); ++i)
+        {
+            const CRcvFreshLoss& rec = fresh[i];
+
+            if (!srtlaNakEligible(rec, now, params, want_first))
+                continue;
+
+            const size_t cost = (rec.seq[0] == rec.seq[1]) ? 1 : 2;
+            if (used + cost > params.cap)
+                break; // report is full, the remaining records get their turn next cycle
+
+            plan.report.push_back(i);
+            used += cost;
+
+            if (want_first)
+                plan.confirmed += CSeqNo::seqoff(rec.seq[0], rec.seq[1]) + 1;
+        }
+    }
+
+    // Selection is fresh-first, transmission stays in sequence order.
+    std::sort(plan.report.begin(), plan.report.end());
+
+    return plan;
 }
 

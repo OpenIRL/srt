@@ -55,6 +55,7 @@ struct SrtStatsTableInit
         STAT(SEND, packetsLost, pktSndLoss);
         STAT(SEND, packetsDropped, pktSndDrop);
         STAT(SEND, packetsRetransmitted, pktRetrans);
+        STAT(SEND, quality, pctSndQuality);
         STAT(SEND, packetsFilterExtra, pktSndFilterExtra);
         STAT(SEND, bytes, byteSent);
         STAT(SEND, bytesUnique, byteSentUnique);
@@ -67,6 +68,8 @@ struct SrtStatsTableInit
         STAT(RECV, packets, pktRecv);
         STAT(RECV, packetsUnique, pktRecvUnique);
         STAT(RECV, packetsLost, pktRcvLoss);
+        STAT(RECV, packetsLostConfirmed, pktRcvLossConfirmed);
+        STAT(RECV, quality, pctRcvQuality);
         STAT(RECV, packetsDropped, pktRcvDrop);
         STAT(RECV, packetsRetransmitted, pktRcvRetrans);
         STAT(RECV, packetsBelated, pktRcvBelated);

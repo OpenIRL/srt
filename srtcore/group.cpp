@@ -90,7 +90,7 @@ bool CUDTGroup::applyGroupSequences(SRTSOCKET target, int32_t& w_snd_isn, int32_
 
             // NOTE: the groupwise scheduling sequence might have been set
             // already. If so, it means that it was set by either:
-            // - the call of this function on the very first conencted socket (see below)
+            // - the call of this function on the very first connected socket (see below)
             // - the call to `sendBroadcast` or `sendBackup`
             // In both cases, we want THIS EXACTLY value to be reported
             if (m_iLastSchedSeqNo != -1)
@@ -205,7 +205,7 @@ void CUDTGroup::debugMasterData(SRTSOCKET slave)
     else
     {
         // The returned master_st is the master's start time. Calculate the
-        // differene time.
+        // difference time.
         IF_LOGGING(steady_clock::duration master_tdiff = m_tsStartTime - start_time);
         LOGC(cnlog.Debug, log << CONID() << "FOUND GROUP MASTER LINK: peer=$" << mpeer
                 << " - start time diff: " << FormatDuration<DUNIT_S>(master_tdiff));
@@ -347,6 +347,36 @@ void CUDTGroup::setOpt(SRT_SOCKOPT optName, const void* optval, int optlen)
 
     switch (optName)
     {
+        // First go options that are NOT ALLOWED to be modified on the group.
+        // (socket-only), or are read-only.
+
+    case SRTO_ISN: // read-only
+    case SRTO_STATE: // read-only
+    case SRTO_EVENT: // read-only
+    case SRTO_SNDDATA: // read-only
+    case SRTO_RCVDATA: // read-only
+    case SRTO_KMSTATE: // read-only
+    case SRTO_VERSION: // read-only
+    case SRTO_PEERVERSION: // read-only
+    case SRTO_SNDKMSTATE: // read-only
+    case SRTO_RCVKMSTATE: // read-only
+    case SRTO_GROUPTYPE: // read-only
+        LOGC(gmlog.Error, log << "group option setter: this option ("<< int(optName) << ") is read-only");
+        throw CUDTException(MJ_NOTSUP, MN_INVAL, 0);
+
+    case SRTO_SENDER: // deprecated (1.2.0 version legacy)
+    case SRTO_IPV6ONLY: // link-type specific
+    case SRTO_RENDEZVOUS: // socket-only
+    case SRTO_BINDTODEVICE: // socket-specific
+    case SRTO_GROUPCONNECT: // listener-specific
+        LOGC(gmlog.Error, log << "group option setter: this option ("<< int(optName) << ") is socket- or link-specific");
+        throw CUDTException(MJ_NOTSUP, MN_INVAL, 0);
+
+    case SRTO_TRANSTYPE:
+    case SRTO_TSBPDMODE:
+    case SRTO_CONGESTION:
+        LOGC(gmlog.Error, log << "group option setter: this option (" << int(optName) << ") removes live mode, which is the only supported for groups");
+        throw CUDTException(MJ_NOTSUP, MN_INVAL, 0);
     case SRTO_RCVSYN:
         m_bSynRecving = cast_optval<bool>(optval, optlen);
         return;
@@ -369,7 +399,7 @@ void CUDTGroup::setOpt(SRT_SOCKOPT optName, const void* optval, int optlen)
         const int min_timeo_ms = (int) CSrtConfig::COMM_DEF_MIN_STABILITY_TIMEOUT_MS;
         if (val_ms < min_timeo_ms)
         {
-            LOGC(qmlog.Error,
+            LOGC(gmlog.Error,
                  log << "group option: SRTO_GROUPMINSTABLETIMEO min allowed value is " << min_timeo_ms << " ms.");
             throw CUDTException(MJ_NOTSUP, MN_INVAL, 0);
         }
@@ -385,7 +415,7 @@ void CUDTGroup::setOpt(SRT_SOCKOPT optName, const void* optval, int optlen)
 
         if (val_ms > idletmo)
         {
-            LOGC(qmlog.Error,
+            LOGC(gmlog.Error,
                  log << "group option: SRTO_GROUPMINSTABLETIMEO=" << val_ms << " exceeds SRTO_PEERIDLETIMEO=" << idletmo);
             throw CUDTException(MJ_NOTSUP, MN_INVAL, 0);
         }
@@ -431,6 +461,14 @@ void CUDTGroup::setOpt(SRT_SOCKOPT optName, const void* optval, int optlen)
         }
     }
 
+    // Before possibly storing the option, check if it is settable on a socket.
+    CSrtConfig testconfig;
+
+    // Note: this call throws CUDTException by itself.
+    int result = testconfig.set(optName, optval, optlen);
+    if (result == -1) // returned in case of unknown option
+        throw CUDTException(MJ_NOTSUP, MN_INVAL, 0);
+
     // Store the option regardless if pre or post. This will apply
     m_config.push_back(ConfigItem(optName, optval, optlen));
 }
@@ -444,21 +482,43 @@ static bool operator!=(const struct linger& l1, const struct linger& l2)
     return l1.l_onoff != l2.l_onoff || l1.l_linger != l2.l_linger;
 }
 
+/// A function template to import socket option of a trivial type.
+/// This includes linger, bool, int8_t, int32_t, int64_t, double, etc.
+/// Potentially can be extended to trivially_copyable if needed.
 template <class ValueType>
-static void importOption(vector<CUDTGroup::ConfigItem>& storage, SRT_SOCKOPT optname, const ValueType& field)
+static void importTrivialOption(vector<CUDTGroup::ConfigItem>& storage, SRT_SOCKOPT optname, const ValueType& optval, const int optsize = sizeof(ValueType))
 {
-    ValueType default_opt             = ValueType();
-    static const int default_opt_size = sizeof(ValueType);
-    ValueType opt                     = field;
-    int opt_size                      = default_opt_size;
-    if (!getOptDefault(optname, (&default_opt), (opt_size)) || default_opt != opt)
+    SRT_STATIC_ASSERT(std::is_trivial<ValueType>::value, "ValueType must be a trivial type.");
+    ValueType optval_dflt = ValueType();
+    int optsize_dflt      = sizeof(ValueType);
+    if (!getOptDefault(optname, (&optval_dflt), (optsize_dflt)) || optval_dflt != optval)
     {
-        SRT_ASSERT(opt_size == default_opt_size);
+        SRT_ASSERT(optsize == sizeof(ValueType));
         // Store the option when:
         // - no default for this option is found
-        // - the option value retrieved from the field is different than default
-        storage.push_back(CUDTGroup::ConfigItem(optname, &opt, default_opt_size));
+        // - the option value retrieved from the field is different from the default one
+#if HAVE_FULL_CXX11
+		storage.emplace_back(optname, &optval, optsize);
+#else
+        storage.push_back(CUDTGroup::ConfigItem(optname, &optval, optsize));
+#endif
     }
+}
+
+/// A function template to import a StringStorage option.
+template <size_t N>
+static void importStringOption(vector<CUDTGroup::ConfigItem>& storage, SRT_SOCKOPT optname, const StringStorage<N>& optval)
+{
+    if (optval.empty())
+        return;
+
+    // Store the option when:
+    // - option has a value (default is empty).
+#if HAVE_FULL_CXX11
+    storage.emplace_back(optname, optval.c_str(),(int) optval.size());
+#else
+    storage.push_back(CUDTGroup::ConfigItem(optname, optval.c_str(), (int) optval.size()));
+#endif
 }
 
 // This function is called by the same premises as the CUDT::CUDT(const CUDT&) (copy constructor).
@@ -502,17 +562,18 @@ void CUDTGroup::deriveSettings(CUDT* u)
     // to be potentially replicated on the socket. So both pre
     // and post options apply.
 
-#define IM(option, field) importOption(m_config, option, u->m_config.field)
-#define IMF(option, field) importOption(m_config, option, u->field)
+#define IM(option, field) importTrivialOption(m_config, option, u->m_config.field)
+#define IMF(option, field) importTrivialOption(m_config, option, u->field)
 
     IM(SRTO_MSS, iMSS);
     IM(SRTO_FC, iFlightFlagSize);
 
     // Nonstandard
-    importOption(m_config, SRTO_SNDBUF, u->m_config.iSndBufSize * (u->m_config.iMSS - CPacket::UDP_HDR_SIZE));
-    importOption(m_config, SRTO_RCVBUF, u->m_config.iRcvBufSize * (u->m_config.iMSS - CPacket::UDP_HDR_SIZE));
+    importTrivialOption(m_config, SRTO_SNDBUF, u->m_config.iSndBufSize * (u->m_config.iMSS - CPacket::UDP_HDR_SIZE));
+    importTrivialOption(m_config, SRTO_RCVBUF, u->m_config.iRcvBufSize * (u->m_config.iMSS - CPacket::UDP_HDR_SIZE));
 
     IM(SRTO_LINGER, Linger);
+
     IM(SRTO_UDP_SNDBUF, iUDPSndBufSize);
     IM(SRTO_UDP_RCVBUF, iUDPRcvBufSize);
     // SRTO_RENDEZVOUS: impossible to have it set on a listener socket.
@@ -520,7 +581,7 @@ void CUDTGroup::deriveSettings(CUDT* u)
 
     // SRTO_CONNTIMEO requires a special handling, because API stores the value in integer milliseconds,
     // but the type of the variable is srt::sync::duration.
-    importOption(m_config, SRTO_CONNTIMEO, (int) count_milliseconds(u->m_config.tdConnTimeOut));
+    importTrivialOption(m_config, SRTO_CONNTIMEO, (int) count_milliseconds(u->m_config.tdConnTimeOut));
 
     IM(SRTO_DRIFTTRACER, bDriftTracer);
     // Reuseaddr: true by default and should only be true.
@@ -534,12 +595,12 @@ void CUDTGroup::deriveSettings(CUDT* u)
     IM(SRTO_RCVLATENCY, iRcvLatency);
     IM(SRTO_PEERLATENCY, iPeerLatency);
     IM(SRTO_SNDDROPDELAY, iSndDropDelay);
-    // Special handling of SRTO_PAYLOADSIZE becuase API stores the value as int32_t,
+    // Special handling of SRTO_PAYLOADSIZE because API stores the value as int32_t,
     // while the config structure stores it as size_t.
-    importOption(m_config, SRTO_PAYLOADSIZE, (int)u->m_config.zExpPayloadSize);
+    importTrivialOption(m_config, SRTO_PAYLOADSIZE, (int)u->m_config.zExpPayloadSize);
     IMF(SRTO_TLPKTDROP, m_bTLPktDrop);
 
-    importOption(m_config, SRTO_STREAMID, u->m_config.sStreamName.str());
+    importStringOption(m_config, SRTO_STREAMID, u->m_config.sStreamName);
 
     IM(SRTO_MESSAGEAPI, bMessageAPI);
     IM(SRTO_NAKREPORT, bRcvNakReport);
@@ -548,22 +609,22 @@ void CUDTGroup::deriveSettings(CUDT* u)
     IM(SRTO_IPV6ONLY, iIpV6Only);
     IM(SRTO_PEERIDLETIMEO, iPeerIdleTimeout_ms);
 
-    importOption(m_config, SRTO_PACKETFILTER, u->m_config.sPacketFilterConfig.str());
+    importStringOption(m_config, SRTO_PACKETFILTER, u->m_config.sPacketFilterConfig);
 
-    importOption(m_config, SRTO_PBKEYLEN, (int) u->m_pCryptoControl->KeyLen());
+    importTrivialOption(m_config, SRTO_PBKEYLEN, (int) u->m_pCryptoControl->KeyLen());
 
     // Passphrase is empty by default. Decipher the passphrase and
     // store as passphrase option
     if (u->m_config.CryptoSecret.len)
     {
-        string password((const char*)u->m_config.CryptoSecret.str, u->m_config.CryptoSecret.len);
-        m_config.push_back(ConfigItem(SRTO_PASSPHRASE, password.c_str(), (int)password.size()));
+        const StringStorage<HAICRYPT_SECRET_MAX_SZ> password((const char*)u->m_config.CryptoSecret.str, u->m_config.CryptoSecret.len);
+        importStringOption(m_config, SRTO_PASSPHRASE, password);
     }
 
     IM(SRTO_KMREFRESHRATE, uKmRefreshRatePkt);
     IM(SRTO_KMPREANNOUNCE, uKmPreAnnouncePkt);
 
-    string cc = u->m_CongCtl.selected_name();
+    const string cc = u->m_CongCtl.selected_name();
     if (cc != "live")
     {
         m_config.push_back(ConfigItem(SRTO_CONGESTION, cc.c_str(), (int)cc.size()));
@@ -577,6 +638,7 @@ void CUDTGroup::deriveSettings(CUDT* u)
 #undef IMF
 }
 
+// XXX This function is likely of no use now.
 bool CUDTGroup::applyFlags(uint32_t flags, HandshakeSide)
 {
     const bool synconmsg = IsSet(flags, SRT_GFLAG_SYNCONMSG);
@@ -592,16 +654,18 @@ bool CUDTGroup::applyFlags(uint32_t flags, HandshakeSide)
 template <class Type>
 struct Value
 {
-    static int fill(void* optval, int, Type value)
+    static int fill(void* optval, int len, const Type& value)
     {
-        // XXX assert size >= sizeof(Type) ?
+        if (size_t(len) < sizeof(Type))
+            return 0;
+
         *(Type*)optval = value;
         return sizeof(Type);
     }
 };
 
 template <>
-inline int Value<std::string>::fill(void* optval, int len, std::string value)
+inline int Value<std::string>::fill(void* optval, int len, const std::string& value)
 {
     if (size_t(len) < value.size())
         return 0;
@@ -648,7 +712,7 @@ static bool getOptDefault(SRT_SOCKOPT optname, void* pw_optval, int& w_optlen)
 
     case SRTO_SNDBUF:
     case SRTO_RCVBUF:
-        w_optlen = fillValue((pw_optval), w_optlen, CSrtConfig::DEF_BUFFER_SIZE * (CSrtConfig::DEF_MSS - CPacket::UDP_HDR_SIZE));
+        w_optlen = fillValue<int>((pw_optval), w_optlen, CSrtConfig::DEF_BUFFER_SIZE * (CSrtConfig::DEF_MSS - CPacket::UDP_HDR_SIZE));
         break;
 
     case SRTO_LINGER:
@@ -666,10 +730,16 @@ static bool getOptDefault(SRT_SOCKOPT optname, void* pw_optval, int& w_optlen)
         RD(true);
     case SRTO_MAXBW:
         RD(int64_t(-1));
+#ifdef ENABLE_MAXREXMITBW
+    case SRTO_MAXREXMITBW:
+        RD(int64_t(-1));
+#endif
     case SRTO_INPUTBW:
         RD(int64_t(-1));
+    case SRTO_MININPUTBW:
+        RD(int64_t(0));
     case SRTO_OHEADBW:
-        RD(0);
+        RD(SRT_OHEAD_DEFAULT_P100);
     case SRTO_STATE:
         RD(SRTS_INIT);
     case SRTO_EVENT:
@@ -690,8 +760,9 @@ static bool getOptDefault(SRT_SOCKOPT optname, void* pw_optval, int& w_optlen)
         RD(false);
     case SRTO_LATENCY:
     case SRTO_RCVLATENCY:
-    case SRTO_PEERLATENCY:
         RD(SRT_LIVE_DEF_LATENCY_MS);
+    case SRTO_PEERLATENCY:
+        RD(0);
     case SRTO_TLPKTDROP:
         RD(true);
     case SRTO_SNDDROPDELAY:
@@ -702,14 +773,15 @@ static bool getOptDefault(SRT_SOCKOPT optname, void* pw_optval, int& w_optlen)
         RD(SRT_DEF_VERSION);
     case SRTO_PEERVERSION:
         RD(0);
-
+    case SRTO_PEERIDLETIMEO:
+        RD(CSrtConfig::COMM_RESPONSE_TIMEOUT_MS);
     case SRTO_CONNTIMEO:
-        RD(-1);
+        RD(CSrtConfig::DEF_CONNTIMEO_S * 1000); // required milliseconds
     case SRTO_DRIFTTRACER:
         RD(true);
 
     case SRTO_MINVERSION:
-        RD(0);
+        RD(SRT_VERSION_MAJ1);
     case SRTO_STREAMID:
         RD(std::string());
     case SRTO_CONGESTION:
@@ -720,6 +792,10 @@ static bool getOptDefault(SRT_SOCKOPT optname, void* pw_optval, int& w_optlen)
         RD(0);
     case SRTO_GROUPMINSTABLETIMEO:
         RD(CSrtConfig::COMM_DEF_MIN_STABILITY_TIMEOUT_MS);
+    case SRTO_LOSSMAXTTL:
+        RD(0);
+    case SRTO_RETRANSMITALGO:
+        RD(1);
     }
 
 #undef RD
@@ -790,27 +866,33 @@ void CUDTGroup::getOpt(SRT_SOCKOPT optname, void* pw_optval, int& w_optlen)
     {
         // Can't have m_GroupLock locked while calling getOpt on a member socket
         // because the call will acquire m_ControlLock leading to a lock-order-inversion.
+        SRTSOCKET firstsocket = SRT_INVALID_SOCK;
         enterCS(m_GroupLock);
         gli_t gi = m_Group.begin();
-        CUDTSocket* const ps = (gi != m_Group.end()) ? gi->ps : NULL;
-        CUDTUnited::SocketKeeper sk(CUDT::uglobal(), ps);
+        if (gi != m_Group.end())
+            firstsocket = gi->ps->core().id();
         leaveCS(m_GroupLock);
-        if (sk.socket)
+        // CUDTUnited::m_GlobControlLock can't be acquired with m_GroupLock either.
+        // We have also no guarantee that after leaving m_GroupLock the socket isn't
+        // going to be deleted. Hence use the safest method by extracting through the id.
+        if (firstsocket != SRT_INVALID_SOCK)
         {
-            // Return the value from the first member socket, if any is present
-            // Note: Will throw exception if the request is wrong.
-            sk.socket->core().getOpt(optname, (pw_optval), (w_optlen));
-            is_set_on_socket = true;
+            CUDTUnited::SocketKeeper sk(CUDT::uglobal(), firstsocket);
+            if (sk.socket)
+            {
+                // Return the value from the first member socket, if any is present
+                // Note: Will throw exception if the request is wrong.
+                sk.socket->core().getOpt(optname, (pw_optval), (w_optlen));
+                is_set_on_socket = true;
+            }
         }
     }
 
     // Check if the option is in the storage, which means that
     // it was modified on the group.
+    vector<ConfigItem>::const_iterator i = find_if(m_config.begin(), m_config.end(), FOptionValue(optname));
 
-    vector<ConfigItem>::const_iterator i = find_if(m_config.begin(), m_config.end(),
-            FOptionValue(optname));
-
-    if (i == m_config.end())
+    if (i == m_config.end() || i->value.empty())
     {
         // Already written to the target variable.
         if (is_set_on_socket)
@@ -822,15 +904,14 @@ void CUDTGroup::getOpt(SRT_SOCKOPT optname, void* pw_optval, int& w_optlen)
 
         return;
     }
-    // NOTE: even if is_set_on_socket, if it was also found in the group
-    // settings, overwrite with the value from the group.
 
-    // Found, return the value from the storage.
+    // Found a value set on or derived by a group. Prefer returning it over the one taken from a member socket.
     // Check the size first.
     if (w_optlen < int(i->value.size()))
         throw CUDTException(MJ_NOTSUP, MN_XSIZE, 0);
 
-    w_optlen = (int) i->value.size();
+    SRT_ASSERT(!i->value.empty());
+    w_optlen = (int)i->value.size();
     memcpy((pw_optval), &i->value[0], i->value.size());
 }
 
@@ -854,7 +935,7 @@ SRT_KM_STATE CUDTGroup::getGroupEncryptionState()
             // no password, but peer did, and ENFORCEDENCRYPTION=false allowed
             // this connection to be established. UNSECURED can't be taken in this
             // case because this would suggest that BOTH are unsecured, that is,
-            // we have established an unsecured connection (which ain't true).
+            // we have established an unsecured connection (which is not true).
             if (gst == SRT_KM_S_UNSECURED && cc->m_SndKmState == SRT_KM_S_NOSECRET)
                 gst = SRT_KM_S_NOSECRET;
             kmstates.insert(gst);
@@ -967,7 +1048,7 @@ void CUDTGroup::close()
     vector<SRTSOCKET> ids;
 
     {
-        ScopedLock glob(CUDT::uglobal().m_GlobControlLock);
+        ExclusiveLock glob(CUDT::uglobal().m_GlobControlLock);
         ScopedLock g(m_GroupLock);
 
         m_bClosing = true;
@@ -1069,7 +1150,7 @@ void CUDTGroup::close()
     // Release blocked clients
     // XXX This looks like a dead code. Group receiver functions
     // do not use any lock on m_RcvDataLock, it is likely a remainder
-    // of the old, internal impementation. 
+    // of the old, internal implementation.
     // CSync::lock_notify_one(m_RcvDataCond, m_RcvDataLock);
 }
 
@@ -1396,9 +1477,28 @@ int CUDTGroup::sendBroadcast(const char* buf, int len, SRT_MSGCTRL& w_mc)
 
     // { send_CheckBrokenSockets()
 
-    if (!pendingSockets.empty())
+    // Make an extra loop check to see if we could be
+    // in a condition of "all sockets either blocked or pending"
+
+    int nsuccessful = 0; // number of successfully connected sockets
+    int nblocked    = 0; // number of sockets blocked in connection
+    bool is_pending_blocked = false;
+    for (vector<Sendstate>::iterator is = sendstates.begin(); is != sendstates.end(); ++is)
     {
-        HLOGC(gslog.Debug, log << "grp/sendBroadcast: found pending sockets, polling them.");
+        if (is->stat != -1)
+        {
+            nsuccessful++;
+        }
+        // is->stat == -1
+        else if (is->code == SRT_EASYNCSND)
+        {
+            ++nblocked;
+        }
+    }
+
+    if (!pendingSockets.empty() || nblocked)
+    {
+        HLOGC(gslog.Debug, log << "grp/sendBroadcast: found pending sockets (blocked: " << nblocked << "), polling them.");
 
         // These sockets if they are in pending state, they should be added to m_SndEID
         // at the connecting stage.
@@ -1413,12 +1513,24 @@ int CUDTGroup::sendBroadcast(const char* buf, int len, SRT_MSGCTRL& w_mc)
         }
         else
         {
+            int swait_timeout = 0;
+
+            // There's also a hidden condition here that is the upper if condition.
+            is_pending_blocked = (nsuccessful == 0);
+
+            // If this is the case when 
+            if (m_bSynSending && is_pending_blocked)
+            {
+                HLOGC(gslog.Debug, log << "grp/sendBroadcast: will block for " << m_iSndTimeOut << " - waiting for any writable in blocking mode");
+                swait_timeout = m_iSndTimeOut;
+            }
+
             {
                 InvertedLock ug(m_GroupLock);
 
                 THREAD_PAUSED();
                 m_Global.m_EPoll.swait(
-                    *m_SndEpolld, sready, 0, false /*report by retval*/); // Just check if anything happened
+                    *m_SndEpolld, (sready), swait_timeout, false /*report by retval*/); // Just check if anything happened
                 THREAD_RESUMED();
             }
 
@@ -1431,6 +1543,10 @@ int CUDTGroup::sendBroadcast(const char* buf, int len, SRT_MSGCTRL& w_mc)
             HLOGC(gslog.Debug, log << "grp/sendBroadcast: RDY: " << DisplayEpollResults(sready));
 
             // sockets in EX: should be moved to wipeme.
+            // IMPORTANT: we check only PENDING sockets (not blocked) because only
+            // pending sockets might report ERR epoll without being explicitly broken.
+            // Sockets that did connect and just have buffer full will be always broken,
+            // if they're going to report ERR in epoll.
             for (vector<SRTSOCKET>::iterator i = pendingSockets.begin(); i != pendingSockets.end(); ++i)
             {
                 if (CEPoll::isready(sready, *i, SRT_EPOLL_ERR))
@@ -1442,6 +1558,9 @@ int CUDTGroup::sendBroadcast(const char* buf, int len, SRT_MSGCTRL& w_mc)
                     int no_events = 0;
                     m_Global.m_EPoll.update_usock(m_SndEID, *i, &no_events);
                 }
+
+                if (CEPoll::isready(sready, *i, SRT_EPOLL_OUT))
+                    is_pending_blocked = false;
             }
 
             // After that, all sockets that have been reported
@@ -1458,7 +1577,10 @@ int CUDTGroup::sendBroadcast(const char* buf, int len, SRT_MSGCTRL& w_mc)
     if (m_bClosing)
         throw CUDTException(MJ_CONNECTION, MN_CONNLOST, 0);
 
-    send_CloseBrokenSockets(wipeme);
+    // Just for a case, when a socket that was blocked or pending
+    // had switched to write-enabled, 
+
+    send_CloseBrokenSockets((wipeme)); // wipeme will be cleared by this function
 
     // Re-check after the waiting lock has been reacquired
     if (m_bClosing)
@@ -1720,9 +1842,18 @@ int CUDTGroup::sendBroadcast(const char* buf, int len, SRT_MSGCTRL& w_mc)
 
     if (none_succeeded)
     {
-        HLOGC(gslog.Debug, log << "grp/sendBroadcast: all links broken (none succeeded to send a payload)");
         m_Global.m_EPoll.update_events(id(), m_sPollID, SRT_EPOLL_OUT, false);
-        m_Global.m_EPoll.update_events(id(), m_sPollID, SRT_EPOLL_ERR, true);
+        if (!m_bSynSending && (is_pending_blocked || was_blocked))
+        {
+            HLOGC(gslog.Debug, log << "grp/sendBroadcast: no links are ready for sending");
+            ercode = SRT_EASYNCSND;
+        }
+        else
+        {
+            HLOGC(gslog.Debug, log << "grp/sendBroadcast: all links broken (none succeeded to send a payload)");
+            m_Global.m_EPoll.update_events(id(), m_sPollID, SRT_EPOLL_ERR, true);
+        }
+
         // Reparse error code, if set.
         // It might be set, if the last operation was failed.
         // If any operation succeeded, this will not be executed anyway.
@@ -2549,6 +2680,12 @@ void CUDTGroup::bstatsSocket(CBytePerfMon* perf, bool clear)
     perf->mbpsSendRate    = double(perf->byteSent) * 8.0 / interval;
     perf->mbpsRecvRate    = double(perf->byteRecv) * 8.0 / interval;
 
+    // The group keeps no loss counters of its own - loss is a per-member property,
+    // and so is the sampling window that backs these. Report a clean window and
+    // let the caller query the member sockets for the real thing.
+    perf->pctSndQuality = 100.0;
+    perf->pctRcvQuality = 100.0;
+
     if (clear)
     {
         m_stats.reset();
@@ -2845,7 +2982,7 @@ CUDTGroup::BackupMemberState CUDTGroup::sendBackup_QualifyActiveState(const gli_
     const int64_t probing_period_us = initial_stabtout_us + 5 * CUDT::COMM_SYN_INTERVAL_US;
 
     // RTT and RTTVar values are still being refined during the probing period,
-    // therefore the dymanic timeout should not be used during the probing period.
+    // therefore the dynamic timeout should not be used during the probing period.
     const bool is_activation_phase = !is_zero(u.freshActivationStart())
         && (count_microseconds(currtime - u.freshActivationStart()) <= probing_period_us);
 
@@ -3282,7 +3419,7 @@ void CUDTGroup::send_CloseBrokenSockets(vector<SRTSOCKET>& w_wipeme)
         // With unlocked GroupLock, we can now lock GlobControlLock.
         // This is needed to prevent any of them deleted from the container
         // at the same time.
-        ScopedLock globlock(CUDT::uglobal().m_GlobControlLock);
+        SharedLock globlock(CUDT::uglobal().m_GlobControlLock);
 
         for (vector<SRTSOCKET>::iterator p = w_wipeme.begin(); p != w_wipeme.end(); ++p)
         {
@@ -3319,7 +3456,7 @@ void CUDTGroup::sendBackup_CloseBrokenSockets(SendBackupCtx& w_sendBackupCtx)
     // With unlocked GroupLock, we can now lock GlobControlLock.
     // This is needed prevent any of them be deleted from the container
     // at the same time.
-    ScopedLock globlock(CUDT::uglobal().m_GlobControlLock);
+    SharedLock globlock(CUDT::uglobal().m_GlobControlLock);
 
     typedef vector<BackupMemberStateEntry>::const_iterator const_iter_t;
     for (const_iter_t member = w_sendBackupCtx.memberStates().begin(); member != w_sendBackupCtx.memberStates().end(); ++member)
@@ -3376,11 +3513,13 @@ void CUDTGroup::sendBackup_RetryWaitBlocked(SendBackupCtx&       w_sendBackupCtx
     // Note: A link is added in unstableLinks if sending has failed with SRT_ESYNCSND.
     const unsigned num_unstable = w_sendBackupCtx.countMembersByState(BKUPST_ACTIVE_UNSTABLE);
     const unsigned num_wary     = w_sendBackupCtx.countMembersByState(BKUPST_ACTIVE_UNSTABLE_WARY);
-    if ((num_unstable + num_wary == 0) || !w_none_succeeded)
+    const unsigned num_pending  = w_sendBackupCtx.countMembersByState(BKUPST_PENDING);
+    if ((num_unstable + num_wary + num_pending == 0) || !w_none_succeeded)
         return;
 
-    HLOGC(gslog.Debug, log << "grp/sendBackup: no successfull sending: "
-        << (num_unstable + num_wary) << " unstable links - waiting to retry sending...");
+    HLOGC(gslog.Debug, log << "grp/sendBackup: no successful sending: "
+        << (num_unstable + num_wary) << " unstable links, "
+        << num_pending << " pending - waiting to retry sending...");
 
     // Note: GroupLock is set already, skip locks and checks
     getGroupData_LOCKED((w_mc.grpdata), (&w_mc.grpdata_size));
@@ -3454,9 +3593,8 @@ RetryWaitBlocked:
                 CUDTSocket* s = m_Global.locateSocket(id, CUDTUnited::ERH_RETURN); // << LOCKS m_GlobControlLock!
                 if (s)
                 {
-                    HLOGC(gslog.Debug,
-                        log << "grp/sendBackup: swait/ex on @" << (id)
-                        << " while waiting for any writable socket - CLOSING");
+                    HLOGC(gslog.Debug, log << "grp/sendBackup: swait/ex on @" << id
+                            << " while waiting for any writable socket - CLOSING");
                     CUDT::uglobal().close(s); // << LOCKS m_GlobControlLock, then GroupLock!
                 }
                 else
@@ -3486,6 +3624,32 @@ RetryWaitBlocked:
         // You can safely throw here - nothing to fill in when all sockets down.
         // (timeout was reported by exception in the swait call).
         throw CUDTException(MJ_CONNECTION, MN_CONNLOST, 0);
+    }
+
+    // IMPORTANT!
+    // There was a socket deletion possibly done above, and as well there
+    // was the m_GroupLock lifted for that check activity, so potentially any socket
+    // from m_Group container could be deleted; review them and remove any dangling
+    // objects from w_sendBackupCtx.
+    //
+    // Due to the nature of the m_Group container, use mark-and-sweep method.
+
+    set<SRTSOCKET> remain;
+    w_sendBackupCtx.getSocketIds( (remain) );
+
+    // MARK
+    for (gli_t d = m_Group.begin(); d != m_Group.end(); ++d)
+    {
+        remain.erase(d->id);
+    }
+
+    HLOGC(gslog.Debug, log << "grp/sendBackup: RE-LOCK, checking members deleted in the meantime: "
+            << Printable(remain));
+
+    // SWEEP
+    for (set<SRTSOCKET>::iterator i = remain.begin(); i != remain.end(); ++i)
+    {
+        w_sendBackupCtx.deleteById(*i);
     }
 
     // Ok, now check if we have at least one write-ready.
@@ -3566,7 +3730,7 @@ void CUDTGroup::sendBackup_SilenceRedundantLinks(SendBackupCtx& w_sendBackupCtx,
 {
     // The most important principle is to keep the data being sent constantly,
     // even if it means temporarily full redundancy.
-    // A member can be silenced only if there is at least one stable memebr.
+    // A member can be silenced only if there is at least one stable member.
     const unsigned num_stable = w_sendBackupCtx.countMembersByState(BKUPST_ACTIVE_STABLE);
     if (num_stable == 0)
         return;
@@ -3636,6 +3800,7 @@ int CUDTGroup::sendBackup(const char* buf, int len, SRT_MSGCTRL& w_mc)
 {
     if (len <= 0)
     {
+        LOGC(gslog.Error, log << "grp/send(backup): negative length: " << len);
         throw CUDTException(MJ_NOTSUP, MN_INVAL, 0);
     }
 
@@ -3655,6 +3820,7 @@ int CUDTGroup::sendBackup(const char* buf, int len, SRT_MSGCTRL& w_mc)
     if (m_bClosing)
     {
         leaveCS(m_Global.m_GlobControlLock);
+        LOGC(gslog.Error, log << "grp/send(backup): Cannot send, connection lost!");
         throw CUDTException(MJ_CONNECTION, MN_CONNLOST, 0);
     }
 
@@ -4048,7 +4214,7 @@ void CUDTGroup::processKeepalive(CUDTGroup::SocketData* gli)
         // the sequence per being IDLE and empty buffer), so a large portion of initial
         // series of packets may come with past sequence, delaying this way with ACK,
         // which may result not only with exceeded stability timeout (which fortunately
-        // isn't being measured in this case), but also with receiveing keepalive
+        // isn't being measured in this case), but also with receiving keepalive
         // (therefore we also don't reset the link to IDLE in the temporary activation period).
         if (gli->sndstate == SRT_GST_RUNNING && is_zero(gli->ps->core().m_tsFreshActivation))
         {

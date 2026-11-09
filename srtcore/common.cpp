@@ -67,6 +67,7 @@ modified by
 #include "logging.h"
 #include "packet.h"
 #include "threadname.h"
+#include "logger_defs.h"
 
 using namespace std;
 using namespace srt::sync;
@@ -92,6 +93,9 @@ m_iMinor(minor)
        m_iErrno = NET_ERROR;
    else
       m_iErrno = err;
+   // XXX No logging allowed because this constructor can be also used for
+   // initializing global object. That problem should be solved separately.
+   // HLOGC(aclog.Debug, log << "CREATED SRT EXCEPTION: " << (1000*major+minor) << " errno=" << m_iErrno);
 }
 
 const char* srt::CUDTException::getErrorMessage() const ATR_NOTHROW
@@ -464,12 +468,12 @@ bool SrtParseConfig(const string& s, SrtConfig& w_config)
     return true;
 }
 
-std::string FormatLossArray(const std::vector< std::pair<int32_t, int32_t> >& lra)
+string FormatLossArray(const vector< pair<int32_t, int32_t> >& lra)
 {
-    std::ostringstream os;
+    ostringstream os;
 
     os << "[ ";
-    for (std::vector< std::pair<int32_t, int32_t> >::const_iterator i = lra.begin(); i != lra.end(); ++i)
+    for (vector< pair<int32_t, int32_t> >::const_iterator i = lra.begin(); i != lra.end(); ++i)
     {
         int len = CSeqNo::seqoff(i->first, i->second);
         os << "%" << i->first;
@@ -481,6 +485,16 @@ std::string FormatLossArray(const std::vector< std::pair<int32_t, int32_t> >& lr
     os << "]";
     return os.str();
 }
+
+string FormatValue(int value, int factor, const char* unit)
+{
+    ostringstream out;
+    double showval = value;
+    showval /= factor;
+    out << std::fixed << showval << unit;
+    return out.str();
+}
+
 
 ostream& PrintEpollEvent(ostream& os, int events, int et_events)
 {

@@ -5,6 +5,7 @@
 #include "test_env.h"
 #include "utilities.h"
 #include "common.h"
+#include "core.h"
 
 using namespace srt;
 
@@ -70,4 +71,92 @@ TEST(CIPAddress, IPv4_in_IPv6_pton)
     const uint32_t ip[4]   = {0, 0, htobe32(0x0000FFFF), htobe32(0xC0A80001)};
 
     test_cipaddress_pton(peer_ip, AF_INET6, ip);
+}
+
+void testCookieContest(int32_t agent_cookie, int32_t peer_cookie)
+{
+    using namespace srt;
+    using namespace std;
+
+    cout << "TEST: Cookies: agent=" << hex << agent_cookie
+        << " peer=" << peer_cookie << endl << dec;
+    HandshakeSide agent_side = CUDT::backwardCompatibleCookieContest(agent_cookie, peer_cookie);
+    EXPECT_EQ(agent_side, HSD_INITIATOR);
+    HandshakeSide peer_side =  CUDT::backwardCompatibleCookieContest(peer_cookie, agent_cookie);
+    EXPECT_EQ(peer_side, HSD_RESPONDER);
+}
+
+TEST(Common, CookieContest)
+{
+    srt::TestInit srtinit;
+    using namespace std;
+
+    srt_setloglevel(LOG_NOTICE);
+
+    // In this function you should pass cookies always in the order: INITIATOR, RESPONDER.
+    cout << "TEST 1: two easy comparable values\n";
+    testCookieContest(100, 50);
+    testCookieContest(-1, -1000);
+    testCookieContest(10055, -10000);
+    testCookieContest(-1480577720, 811599203);
+    testCookieContest( -2147483648, 2147483647);
+    testCookieContest(0x00000001, 0x80000001);
+
+    /* XXX Blocked temporarily because in 1.5.5 they would fail,
+       and it's decided to not provide the fix, which is too
+       dangerous. The real fix will be provided in 1.6.0.
+
+    // Values from PR 1517
+    cout << "TEST 2: Values from PR 1517\n";
+    testCookieContest(811599203, -1480577720);
+    testCookieContest(2147483647, -2147483648);
+
+    cout << "TEST 3: wrong post-fix\n";
+    // NOTE: 0x80000001 is a negative number in hex
+    testCookieContest(0x00000001, 0x80000001);
+    */
+}
+// Quality percentage: the share of a sampling window that was not impaired.
+TEST(StatsQuality, Percentage)
+{
+    // An empty window is reported clean rather than 0/0.
+    EXPECT_DOUBLE_EQ(StatsQualityPct(0, 0), 100.0);
+
+    EXPECT_DOUBLE_EQ(StatsQualityPct(100, 0), 100.0);   // nothing impaired
+    EXPECT_DOUBLE_EQ(StatsQualityPct(0, 100), 0.0);     // nothing got through
+    EXPECT_DOUBLE_EQ(StatsQualityPct(75, 25), 75.0);
+    EXPECT_DOUBLE_EQ(StatsQualityPct(1, 1), 50.0);
+
+    // Negative deltas cannot occur (counters are monotonic) but must not blow up.
+    EXPECT_DOUBLE_EQ(StatsQualityPct(-5, 0), 100.0);
+}
+
+// The metric is a per-window value: each window is scored on its own deltas, so a
+// bad second does not drag the following ones down (the failure mode of a
+// cumulative counter, which can only ever creep back towards its long-run mean).
+TEST(StatsQuality, WindowIsIndependentOfHistory)
+{
+    // Cumulative counters as they would be sampled at successive window ends.
+    struct { int64_t clean, impaired; } snap[] = {
+        {   0,   0},   // window start
+        {1000,   0},   // w1: clean
+        {1500, 500},   // w2: heavily impaired
+        {2500, 500},   // w3: clean again
+    };
+
+    const double w1 = StatsQualityPct(snap[1].clean - snap[0].clean,
+                                      snap[1].impaired - snap[0].impaired);
+    const double w2 = StatsQualityPct(snap[2].clean - snap[1].clean,
+                                      snap[2].impaired - snap[1].impaired);
+    const double w3 = StatsQualityPct(snap[3].clean - snap[2].clean,
+                                      snap[3].impaired - snap[2].impaired);
+
+    EXPECT_DOUBLE_EQ(w1, 100.0);
+    EXPECT_DOUBLE_EQ(w2, 50.0);    // scored on its own second only
+    EXPECT_DOUBLE_EQ(w3, 100.0);   // snaps back, no memory of w2
+
+    // A cumulative reading of the same data would still be dragged down at w3
+    // and could only improve from there - the behaviour this replaces.
+    const double cumulative_w3 = StatsQualityPct(snap[3].clean, snap[3].impaired);
+    EXPECT_LT(cumulative_w3, w3);
 }

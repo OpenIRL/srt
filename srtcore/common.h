@@ -95,6 +95,12 @@ modified by
 #define SRT_STATIC_ASSERT(cond, msg)
 #endif
 
+#if HAVE_FULL_CXX11
+#define FUNID() __func__
+#else
+#define FUNID() __FUNCTION__
+#endif
+
 #include <exception>
 
 namespace srt_logging
@@ -565,7 +571,7 @@ struct EventSlot
 
 // UDT Sequence Number 0 - (2^31 - 1)
 
-// seqcmp: compare two seq#, considering the wraping
+// seqcmp: compare two seq#, considering the wrapping
 // seqlen: length from the 1st to the 2nd seq#, including both
 // seqoff: offset from the 2nd to the 1st seq#
 // incseq: increase the seq# by 1
@@ -601,7 +607,7 @@ public:
        return seqcmp(value, other.value) <= 0;
    }
 
-   // circular arithmetics
+   // circular arithmetic
    friend int operator-(const CSeqNo& c1, const CSeqNo& c2)
    {
        return seqoff(c2.value, c1.value);
@@ -1435,8 +1441,22 @@ inline bool checkMappedIPv4(const sockaddr_in6& sa)
     return checkMappedIPv4(addr);
 }
 
+/// Share of the traffic in a sampled window that was not impaired, in percent.
+/// @param clean    packets that made it through on the first attempt
+/// @param impaired packets that were lost, retransmitted or dropped
+/// @return 100 for an empty window, 0 when nothing came through cleanly
+inline double StatsQualityPct(int64_t clean, int64_t impaired)
+{
+    const int64_t total = clean + impaired;
+    if (total <= 0)
+        return 100.0;
+
+    return (100.0 * clean) / total;
+}
+
 std::string FormatLossArray(const std::vector< std::pair<int32_t, int32_t> >& lra);
 std::ostream& PrintEpollEvent(std::ostream& os, int events, int et_events = 0);
+std::string FormatValue(int value, int factor, const char* unit);
 
 } // namespace srt
 

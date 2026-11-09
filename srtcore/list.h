@@ -54,9 +54,11 @@ modified by
 #define INC_SRT_LIST_H
 
 #include <deque>
+#include <vector>
 
 #include "udt.h"
 #include "common.h"
+#include "utilities.h"
 
 namespace srt {
 
@@ -162,7 +164,7 @@ public:
 
     /// Insert a series of loss seq. no. between "seqno1" and "seqno2" into the receiver's loss list.
     /// @param [in] seqno1 sequence number starts.
-    /// @param [in] seqno2 seqeunce number ends.
+    /// @param [in] seqno2 sequence number ends.
     /// @return length of the loss record inserted (seqlen(seqno1, seqno2)), -1 on error.
     int insert(int32_t seqno1, int32_t seqno2);
 
@@ -203,11 +205,9 @@ public:
     int32_t getFirstLostSeq() const;
 
     /// Get a encoded loss array for NAK report.
-    /// @param [out] array the result list of seq. no. to be included in NAK.
-    /// @param [out] len physical length of the result array.
-    /// @param [in] limit maximum length of the array.
-
-    void getLossArray(int32_t* array, int& len, int limit);
+    /// @param [inout] array the result list of seq. no. to be included in NAK.
+    /// @return physical length of the result array.
+    int getLossArray(FixedArray<int32_t>& array);
 
 private:
     struct Seq
@@ -281,6 +281,7 @@ struct CRcvFreshLoss
     int32_t                             seq[2];
     int                                 ttl;
     srt::sync::steady_clock::time_point timestamp;
+    srt::sync::steady_clock::time_point report_time; // last report time (zero = never); unused in plain SRT
 
     CRcvFreshLoss(int32_t seqlo, int32_t seqhi, int initial_ttl);
 
@@ -300,8 +301,63 @@ struct CRcvFreshLoss
     Emod revoke(int32_t sequence);
     Emod revoke(int32_t lo, int32_t hi);
 
-    static bool removeOne(std::deque<CRcvFreshLoss>& w_container, int32_t sequence, int* had_ttl = NULL);
+    static bool removeOne(std::deque<CRcvFreshLoss>& w_container, int32_t sequence, int* had_ttl = NULL,
+                          srt::sync::steady_clock::time_point* w_detect_time = NULL);
 };
+
+/// Inputs for one SRTLA loss-report decision (see @c srtlaPlanNak). All durations
+/// are in microseconds. Only used when SRTO_SRTLA is set.
+struct SrtlaNakParams
+{
+    int64_t hold_us;    //< reordering grace period before a record may be reported
+    int64_t spacing_us; //< minimum distance between two reports of the same record
+    int64_t budget_us;  //< TSBPD play budget; 0 switches all deadline handling off
+    int64_t rtt_us;     //< round trip a retransmission is expected to take
+    int64_t margin_us;  //< safety margin kept free before the play deadline
+    size_t  cap;        //< capacity of the loss report payload, in 32-bit words
+
+    SrtlaNakParams()
+        : hold_us(0)
+        , spacing_us(0)
+        , budget_us(0)
+        , rtt_us(0)
+        , margin_us(0)
+        , cap(0)
+    {
+    }
+};
+
+/// What to do with the fresh-loss records in this NAK cycle.
+struct SrtlaNakPlan
+{
+    /// Indices into the container passed to @c srtlaPlanNak, in report order. They are
+    /// only valid as long as that container is unmodified, so stamp @c report_time on
+    /// these records FIRST and erase the @c retire prefix afterwards.
+    std::vector<size_t> report;
+    int                 confirmed; //< packets in @c report that are being reported for the first time
+    size_t              retire;    //< number of leading records that outlived the play budget
+
+    SrtlaNakPlan()
+        : confirmed(0)
+        , retire(0)
+    {
+    }
+};
+
+/// Decide which fresh-loss records belong in the next SRTLA loss report.
+///
+/// Unlike plain SRT - where a record is reported once, as soon as its TTL expires, and
+/// then dropped - SRTLA keeps a record until it is either recovered or dropped, and
+/// repeats the request on a timer. This applies the reordering hold, the repeat spacing
+/// and the play deadline, and caps the report at the payload size.
+///
+/// @param fresh  loss records, ordered by detection time (oldest first)
+/// @param now    current time
+/// @param params timing and capacity limits
+/// @return indices to report, the first-report packet count, and the prefix to retire
+SrtlaNakPlan srtlaPlanNak(const std::deque<CRcvFreshLoss>&           fresh,
+                          const srt::sync::steady_clock::time_point& now,
+                          const SrtlaNakParams&                      params);
 
 } // namespace srt
 

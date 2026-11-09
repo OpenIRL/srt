@@ -1,0 +1,126 @@
+# SRTLA end-to-end regression score. Builds two receivers from this repository (the pull request
+# as it would be merged, and the tip of the main branch), drives both with the real BELABOX sender stack through the impairment proxy under
+# Linux (see testing/srtla-e2e/README.md), scores the runs and, on pull requests, posts the
+# scorecard as a comment. build.sh clones the BELABOX repositories at pinned commits and builds
+# them unmodified.
+name: srtla-e2e
+
+on:
+  pull_request:
+    paths: ['srtcore/**', 'testing/srtla-e2e/**', '.github/workflows/srtla-e2e.yml']
+  workflow_dispatch:
+    inputs:
+      base:
+        description: 'git ref to compare against (default: tip of the default branch, main)'
+        default: ''
+      scenarios:
+        description: "scenario set or comma list for run_matrix.py ('ci' = catalogue at 2000 ms plus 5000 ms, 2 and 8 links, slow carriers)"
+        default: 'ci'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: srtla-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # ten parallel jobs; each clones and builds its own binaries (~8 min) and runs every tenth scenario of the set
+        group: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: srt
+          fetch-depth: 0
+      - name: Tools
+        run: sudo apt-get update -q && sudo apt-get install -y -q ninja-build
+      - name: Resolve base (always the main branch unless overridden)
+        id: base
+        working-directory: srt
+        env:
+          BASE_REF: ${{ inputs.base }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          ref="$BASE_REF"
+          [ -n "$ref" ] || ref="origin/$DEFAULT_BRANCH"
+          base_sha="$(git rev-parse --verify --end-of-options "${ref}^{commit}")"
+          echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "head: $(git log --oneline -1 HEAD)"
+          echo "base: $ref ($(git log --oneline -1 "$ref"))"
+      - name: Build receivers, sender, srtla_send
+        working-directory: srt/testing/srtla-e2e
+        run: ./build.sh head=HEAD base=${{ steps.base.outputs.sha }}
+      - name: Run scenarios (two seeds, base and head interleaved)
+        working-directory: srt/testing/srtla-e2e
+        env:
+          SCENARIOS: ${{ inputs.scenarios || 'ci' }}
+        run: |
+          set="$SCENARIOS"
+          ./run_matrix.py base,head "$set" --group ${{ matrix.group }}/10 --out ci-s1 --seed 1
+          ./run_matrix.py base,head "$set" --group ${{ matrix.group }}/10 --out ci-s2 --seed 2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: srtla-e2e-${{ matrix.group }}
+          path: srt/testing/srtla-e2e/results
+          retention-days: 30
+
+  score:
+    needs: e2e
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: srt
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: srtla-e2e-*
+          path: parts
+      - name: Merge and score
+        working-directory: srt/testing/srtla-e2e
+        run: |
+          python3 - <<'PY'
+          import json, glob, os, shutil
+          for seed in ('ci-s1', 'ci-s2'):
+              merged = {}; os.makedirs(os.path.join('results', seed), exist_ok=True)
+              for part in sorted(glob.glob(os.path.join('../../../parts/srtla-e2e-*', seed))):
+                  s = os.path.join(part, 'summary.json')
+                  if os.path.exists(s): merged.update(json.load(open(s)))
+                  for d in os.listdir(part):
+                      if os.path.isdir(os.path.join(part, d)): shutil.copytree(os.path.join(part, d), os.path.join('results', seed, d), dirs_exist_ok=True)
+              json.dump(merged, open(os.path.join('results', seed, 'summary.json'), 'w'), indent=1)
+              print(seed, len(merged), 'scenarios merged')
+          PY
+          ./score.py ci-s1,ci-s2 --base base --head head --markdown scorecard.md --json scorecard.json --fail-on-regression \
+            --title "SRTLA end-to-end score" || echo "regression=1" >> "$GITHUB_ENV"
+          cat scorecard.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: srtla-e2e-scorecard
+          path: |
+            srt/testing/srtla-e2e/scorecard.md
+            srt/testing/srtla-e2e/scorecard.json
+            srt/testing/srtla-e2e/results/ci-s1/summary.json
+            srt/testing/srtla-e2e/results/ci-s2/summary.json
+      - name: Comment on the pull request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('srt/testing/srtla-e2e/scorecard.md', 'utf8') + '\n<sub>srtla-e2e run ' + context.runId + '</sub>';
+            const marker = '### SRTLA end-to-end score';
+            const { data: comments } = await github.rest.issues.listComments({ ...context.repo, issue_number: context.issue.number, per_page: 100 });
+            const mine = comments.find(c => c.user.type === 'Bot' && c.body.startsWith(marker));
+            if (mine) await github.rest.issues.updateComment({ ...context.repo, comment_id: mine.id, body });
+            else await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+      - name: Fail on regression
+        if: env.regression == '1'
+        run: echo "::error::SRTLA end-to-end score regressed against the base (see scorecard)"; exit 1

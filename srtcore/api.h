@@ -120,6 +120,7 @@ public:
     }
 
     ~CUDTSocket();
+    void resetAtFork();
 
     void construct();
 
@@ -215,6 +216,11 @@ public:
         core().m_bClosing = true;
     }
 
+    void setBreaking()
+    {
+        core().m_bBreaking = true;
+    }
+
     /// This does the same as setClosed, plus sets the m_bBroken to true.
     /// Such a socket can still be read from so that remaining data from
     /// the receiver buffer can be read, but no longer sends anything.
@@ -239,6 +245,7 @@ class CUDTUnited
     friend class CUDTGroup;
     friend class CRendezvousQueue;
     friend class CCryptoControl;
+    friend class TestMockCUDT;
 
 public:
     CUDTUnited();
@@ -263,6 +270,7 @@ public:
     /// release the UDT library.
     /// @return 0 if success, otherwise -1 is returned.
     int cleanup();
+    int cleanupAtFork();
 
     /// Create a new UDT socket.
     /// @param [out] pps Variable (optional) to which the new socket will be written, if succeeded
@@ -407,7 +415,7 @@ private:
     groups_t m_Groups;
 #endif
 
-    sync::Mutex m_GlobControlLock; // used to synchronize UDT API
+    sync::SharedMutex m_GlobControlLock; // used to synchronize UDT API
 
     sync::Mutex m_IDLock; // used to synchronize ID generation
 
@@ -462,6 +470,10 @@ private:
 
     CUDTSocket* locateAcquireSocket(SRTSOCKET u, ErrorHandling erh = ERH_RETURN);
     bool acquireSocket(CUDTSocket* s);
+    bool startGarbageCollector();
+    void stopGarbageCollector();
+    void cleanupAllSockets();
+    void closeAllSockets();
 
 public:
     struct SocketKeeper
@@ -518,7 +530,7 @@ private:
     /// @brief Checks if channel configuration matches the socket configuration.
     /// @param cfgMuxer multiplexer configuration.
     /// @param cfgSocket socket configuration.
-    /// @return tru if configurations match, false otherwise.
+    /// @return true if configurations match, false otherwise.
     static bool channelSettingsMatch(const CSrtMuxerConfig& cfgMuxer, const CSrtConfig& cfgSocket);
     static bool inet6SettingsCompat(const sockaddr_any& muxaddr, const CSrtMuxerConfig& cfgMuxer,
         const sockaddr_any& reqaddr, const CSrtMuxerConfig& cfgSocket);
@@ -534,6 +546,7 @@ private:
 
 private:
     srt::sync::atomic<bool> m_bClosing;
+    sync::Mutex             m_GCStartLock;
     sync::Mutex             m_GCStopLock;
     sync::Condition         m_GCStopCond;
 
