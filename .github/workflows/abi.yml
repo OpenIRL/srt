@@ -18,7 +18,7 @@ jobs:
        base_version: ${{ steps.build.outputs.SRT_BASE }}
        tag_version: ${{ steps.build.outputs.SRT_TAG_VERSION }}
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         path: gitview_pr
     - id: configure
@@ -53,7 +53,7 @@ jobs:
         cat $GITHUB_OUTPUT
         echo "---------------------"
     - id: upload_pr_dump
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: abidump_pr
         path: gitview_pr/_build/libsrt-pr.dump
@@ -68,7 +68,7 @@ jobs:
        SRT_BASE: ${{ needs.build_pr.outputs.base_version }}
        SRT_TAG_VERSION: ${{ needs.build_pr.outputs.tag_version }}
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         path: gitview_base
         ref: ${{ env.SRT_BASE }}
@@ -99,7 +99,7 @@ jobs:
         ls -ld libsrt-base.dump
         sha256sum libsrt-base.dump
     - id: upload_base_dump
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: abidump_base
         path: gitview_base/_build/libsrt-base.dump
@@ -113,12 +113,12 @@ jobs:
 
     steps:
     - name: Download base dump
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
       with:
         name: abidump_base
         path: .
     - name: Download pr dump
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
       with:
         name: abidump_pr
         path: .
@@ -142,7 +142,7 @@ jobs:
            exit 0
         fi
     - name: Download report
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: abi-compliance-report
         path: compat_reports/compat_report.html
